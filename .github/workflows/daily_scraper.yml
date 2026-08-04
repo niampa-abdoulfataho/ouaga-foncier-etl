@@ -5,7 +5,7 @@ on:
     # Horaire de production : 15h30 UTC, volontairement décalé de l'heure
     # pile pour éviter la zone de forte charge/retard documentée par GitHub
     # sur les déclenchements schedule proches de hh:00.
-    - cron: "30 15 * * *"
+    - cron: "30 18 * * *"
   workflow_dispatch:
     inputs:
       mode:
