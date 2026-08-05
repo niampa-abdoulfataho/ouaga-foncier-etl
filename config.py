@@ -393,7 +393,24 @@ PAUSE_ENTRE_BATCHES_MIN_S = 15.0
 PAUSE_ENTRE_BATCHES_MAX_S = 45.0
 
 MAX_PAGES_SANS_NOUVEAU_POST = 4  # arrêt du scroll si N étapes consécutives sans post inédit
-MAX_PAGES_ABSOLU = 60  # garde-fou dur pour éviter un scroll infini
+MAX_PAGES_ABSOLU = 60  # garde-fou dur pour éviter un scroll infini (mode "daily")
+
+# Plafond dédié au mode "backfill", plus permissif que MAX_PAGES_ABSOLU.
+# Chiffre choisi le 2026-08-05 après un run réel (group_limit=0, days_back=7) :
+# 11 groupes actifs sur 13 ont buté sur MAX_PAGES_ABSOLU=60 AVANT même
+# d'atteindre la fenêtre de 7 jours (~3,7s/étape observés, donc 60 étapes
+# ~3,7 min/groupe) - donc pour un backfill de 90 jours, 60 est
+# structurellement insuffisant sur les groupes actifs, indépendamment de
+# `days_back`. 250 (~4x) donne une profondeur nettement plus grande
+# (~15 min/groupe si le plafond est atteint) sans viser un chiffre extrême :
+# aucune donnée réelle ne permet de garantir qu'il suffit à couvrir 90 jours
+# pleins sur les groupes les plus actifs (densité de posts/jour inconnue) -
+# à traiter comme un plafond "best effort", pas une garantie de couverture.
+# Le budget de session (SESSION_DUREE_MAX_MINUTES) reste la limite globale :
+# avec ce plafond, un run couvrira moins de groupes avant de s'arrêter
+# proprement, les groupes restants étant repris au(x) run(s) suivant(s).
+MAX_PAGES_ABSOLU_BACKFILL = 250
+
 NAVIGATION_TIMEOUT_MS = 30_000
 
 # Fragments d'URL identifiant une requête GraphQL Facebook (pour intercepter

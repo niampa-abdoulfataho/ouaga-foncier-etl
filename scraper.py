@@ -966,6 +966,7 @@ async def scraper_groupe(
     max_days_back: int,
     seen_ids: dict[str, str],
     delai_multiplicateur: float = 1.0,
+    max_pages_absolu: int = config.MAX_PAGES_ABSOLU,
 ) -> list[dict[str, Any]]:
     """Parcourt un groupe Facebook (web.facebook.com, scroll simulé + capture
     réseau GraphQL) et retourne les nouveaux posts non vus.
@@ -999,6 +1000,10 @@ async def scraper_groupe(
         delai_multiplicateur: facteur appliqué aux délais entre étapes de
             scroll (voir `calculer_ajustements` - >1.0 quand le throttle
             adaptatif a perdu confiance suite à des runs récents suspects).
+        max_pages_absolu: garde-fou dur sur le nombre d'étapes de scroll
+            (voir `config.MAX_PAGES_ABSOLU` / `MAX_PAGES_ABSOLU_BACKFILL` -
+            le mode "backfill" utilise un plafond plus permissif, voir
+            `executer_scraping`).
     """
     date_limite = datetime.now(timezone.utc) - timedelta(days=max_days_back)
     page = await context.new_page()
@@ -1090,7 +1095,7 @@ async def scraper_groupe(
         etapes_sans_nouveau = 0
         etapes_scroll = 0
 
-        while etapes_scroll < config.MAX_PAGES_ABSOLU:
+        while etapes_scroll < max_pages_absolu:
             debut_capture = len(posts_captures)
             # Scroll page-niveau (window), plus fiable en headless que
             # page.mouse.wheel dont l'effet dépend de la position du curseur.
@@ -1145,11 +1150,11 @@ async def scraper_groupe(
 
             etapes_scroll += 1
 
-        if etapes_scroll >= config.MAX_PAGES_ABSOLU:
+        if etapes_scroll >= max_pages_absolu:
             logger.warning(
                 "Groupe %s : garde-fou MAX_PAGES_ABSOLU=%d atteint (arrêt forcé).",
                 groupe.nom,
-                config.MAX_PAGES_ABSOLU,
+                max_pages_absolu,
             )
 
     except PlaywrightTimeoutError as exc:
@@ -1177,8 +1182,13 @@ async def executer_scraping(
     """Point d'entrée principal du module, appelé par main.py.
 
     Args:
-        mode: "daily" ou "backfill" (influence uniquement le logging - le
-            comportement de pagination est identique, seul `days_back` change).
+        mode: "daily" ou "backfill". Influence le logging ET, depuis le
+            2026-08-05, le garde-fou de scroll par groupe : "backfill"
+            utilise `config.MAX_PAGES_ABSOLU_BACKFILL` (plus permissif) au
+            lieu de `config.MAX_PAGES_ABSOLU` - un run réel a montré que ce
+            dernier coupait le scroll de la plupart des groupes actifs avant
+            même d'atteindre `days_back` jours, rendant `days_back` sans
+            effet sur ces groupes en mode "daily" par défaut.
         days_back: fenêtre temporelle en jours (1 pour le quotidien, jusqu'à
             90 pour un rattrapage complet - à répartir en plusieurs runs
             paramétrables via `days_back`/`group_limit` côté CLI/CI plutôt que
@@ -1237,6 +1247,9 @@ async def executer_scraping(
         groups_batch_size,
     )
 
+    plafond_scroll = (
+        config.MAX_PAGES_ABSOLU_BACKFILL if mode == "backfill" else config.MAX_PAGES_ABSOLU
+    )
     seen_ids = charger_seen_ids()
     fichiers_sauvegardes: list[Path] = []
     debut_session = datetime.now(timezone.utc)
@@ -1282,6 +1295,7 @@ async def executer_scraping(
                             days_back,
                             seen_ids,
                             delai_multiplicateur=ajustements.delai_multiplicateur,
+                            max_pages_absolu=plafond_scroll,
                         )
                     except SessionExpireeError as exc:
                         logger.critical(
