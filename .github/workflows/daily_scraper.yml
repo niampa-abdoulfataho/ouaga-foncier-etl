@@ -2,10 +2,14 @@ name: Pipeline ETL Annonces Foncières Ouagadougou
 
 on:
   schedule:
-    # Horaire de production : 15h30 UTC, volontairement décalé de l'heure
-    # pile pour éviter la zone de forte charge/retard documentée par GitHub
-    # sur les déclenchements schedule proches de hh:00.
-    - cron: "30 18 * * *"
+    # TEST (2026-08-05) : 12h00 UTC pour vérifier le déclenchement dans la
+    # journée, sur ce nouveau repo/compte - à noter que c'est une heure
+    # pile, zone documentée par GitHub comme plus à risque de délai/abandon
+    # que les horaires décalés (voir commit df6df08). Le run du 2026-08-04
+    # à 18h30 (event schedule confirmé dans les logs) montre que le
+    # scheduler fonctionne sur ce repo, donc ce test sert surtout à évaluer
+    # l'impact de l'heure pile, pas la fiabilité générale du mécanisme.
+    - cron: "0 12 * * *"
   workflow_dispatch:
     inputs:
       mode:
