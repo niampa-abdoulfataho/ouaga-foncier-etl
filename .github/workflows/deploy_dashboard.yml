@@ -1,0 +1,82 @@
+name: Dashboard - export données + déploiement Shinylive/Pages
+
+# Deux façons de déclencher un rafraîchissement, pour des raisons distinctes :
+# - workflow_run : après CHAQUE run du pipeline de scraping (daily ou
+#   backfill), pour que le dashboard reflète les données à jour sans action
+#   manuelle. Le nom doit correspondre EXACTEMENT au `name:` de
+#   daily_scraper.yml.
+# - push sur dashboard/** : quand le code de l'app change (nouveaux
+#   graphiques, filtres...), indépendamment de toute donnée nouvelle.
+# - workflow_dispatch : déclenchement manuel (ex. premier déploiement, avant
+#   même qu'un run de scraping n'ait eu lieu).
+on:
+  workflow_run:
+    workflows: ["Pipeline ETL Annonces Foncières Ouagadougou"]
+    types: [completed]
+  push:
+    branches: [main]
+    paths:
+      - "dashboard/**"
+      - ".github/workflows/deploy_dashboard.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Un seul déploiement Pages actif à la fois - un déploiement plus récent
+# annule le précédent plutôt que de les empiler inutilement.
+concurrency:
+  group: dashboard-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Si déclenché par workflow_run, ne construit que si le pipeline de
+    # scraping a réellement réussi - un run raté n'ajoute aucune donnée
+    # nouvelle en base, inutile de consommer des minutes CI pour ça.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: "Récupération du dépôt"
+        uses: actions/checkout@v4
+
+      - name: "Installation de Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            dashboard/requirements-export.txt
+
+      - name: "Dépendances de l'export (côté serveur)"
+        run: |
+          pip install -r dashboard/requirements-export.txt
+          pip install shinylive
+
+      - name: "Export des données depuis la base maître"
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python dashboard/export_data.py
+
+      - name: "Build Shinylive (WebAssembly)"
+        run: shinylive export dashboard/app site
+
+      - name: "Upload de l'artefact Pages"
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+          retention-days: 1
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: "Déploiement sur GitHub Pages"
+        id: deployment
+        uses: actions/deploy-pages@v4

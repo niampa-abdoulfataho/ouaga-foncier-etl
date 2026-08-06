@@ -1,0 +1,11 @@
+# Dépendances installées DANS LE NAVIGATEUR par Shinylive (via micropip),
+# pas sur la machine qui lance `shinylive export`. Volontairement sans
+# version épinglée : Shinylive/Pyodide n'expose que certaines versions
+# précompilées en WebAssembly, et figer un numéro de version ici risquerait
+# de pointer vers une version sans roue WASM disponible plutôt que d'aider
+# la reproductibilité (contrairement à requirements.txt à la racine, qui
+# tourne sur un vrai interpréteur CPython où l'épinglage est fiable).
+shiny
+shinywidgets
+pandas
+plotly

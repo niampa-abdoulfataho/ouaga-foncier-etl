@@ -11,6 +11,10 @@ data/logs/
 *.json
 !tests/fixtures/*.json
 !groups.csv
+# Placeholder versionné (vide, sans donnée réelle) - regénéré à chaque
+# déploiement par dashboard/export_data.py, mais commité pour que le repo
+# reste "buildable" tel quel avant le tout premier run du workflow dédié.
+!dashboard/app/data/annonces.json
 
 # Artefacts pytest occasionnels (basetemp créé dans le cwd selon l'environnement)
 pytest-cache-files-*

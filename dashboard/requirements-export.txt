@@ -1,0 +1,8 @@
+# Dépendances de dashboard/export_data.py, qui tourne côté serveur (GitHub
+# Actions), PAS dans le navigateur - à ne pas confondre avec
+# dashboard/app/requirements.txt (dépendances Shinylive/Pyodide, installées
+# dans le navigateur de l'utilisateur).
+#
+# Même version que requirements.txt à la racine du projet, déjà validée par
+# exécution réelle contre PostgreSQL (voir ce fichier pour le détail).
+psycopg[binary]==3.3.4
