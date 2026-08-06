@@ -13,15 +13,24 @@ depuis du code qui tourne dans le navigateur d'un visiteur).
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 from shiny import App, reactive, render, ui
 from shinywidgets import output_widget, render_widget
 
 CHEMIN_DONNEES = Path(__file__).parent / "data" / "annonces.json"
+LONGUEUR_LABEL_MAX = 32
+
+# Palette et thème partagés par tous les graphiques - avant, chaque chart
+# piochait dans les couleurs par défaut de Plotly indépendamment, ce qui
+# donnait un mélange bleu/rouge/orange sans logique d'un onglet à l'autre.
+PALETTE = ["#2C5F8A", "#4F9D69", "#D9822B", "#B4436C", "#6C757D", "#3A8FB7"]
+px.defaults.template = "plotly_white"
+px.defaults.color_discrete_sequence = PALETTE
 
 
 def _charger_donnees() -> tuple[pd.DataFrame, pd.DataFrame, str]:
@@ -51,6 +60,59 @@ def _charger_donnees() -> tuple[pd.DataFrame, pd.DataFrame, str]:
     return annonces, runs, brut.get("exporte_le", "inconnu")
 
 
+def _tronquer(texte: object, longueur: int = LONGUEUR_LABEL_MAX) -> object:
+    """Coupe un nom de groupe trop long pour tenir sur un axe de graphique.
+
+    Le nom complet reste disponible au survol de la souris (hover_name) -
+    on ne perd aucune information, on évite juste que les cartes débordent
+    hors de leur conteneur, ce qui forçait un scroll horizontal.
+    """
+    if not isinstance(texte, str) or len(texte) <= longueur:
+        return texte
+    return texte[: longueur - 1].rstrip() + "…"
+
+
+def _ajouter_nom_court(df: pd.DataFrame) -> pd.DataFrame:
+    """Ajoute une colonne 'groupe_nom_court' pour l'affichage sur les axes."""
+    df = df.copy()
+    df["groupe_nom_court"] = df["groupe_nom"].map(_tronquer)
+    return df
+
+
+def _formater_horodatage(valeur: str) -> str:
+    """Formate un horodatage ISO 8601 en JJ/MM/AAAA HH:MM UTC.
+
+    Retourne la valeur telle quelle si elle n'est pas parsable (cas
+    "jamais"/"inconnu" du placeholder avant le premier export réussi).
+    """
+    try:
+        dt = datetime.fromisoformat(str(valeur).replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return str(valeur)
+    return dt.strftime("%d/%m/%Y %H:%M UTC")
+
+
+def _widget(fig: go.Figure) -> go.FigureWidget:
+    """Enveloppe une figure Plotly Express en FigureWidget, barre d'outils masquée.
+
+    La barre d'outils Plotly (zoom/pan/export PNG) n'apporte rien sur un
+    dashboard de suivi et ajoute du bruit visuel sur chaque carte.
+    shinywidgets fusionne widget._config au moment de l'affichage (vérifié
+    dans le code source de la version installée localement) - c'est donc un
+    mécanisme réel, pas une supposition. Reste une incertitude assumée : la
+    version de shinywidgets réellement chargée par Shinylive/Pyodide en
+    production peut différer de celle testée ici. D'où le try/except : si
+    l'attribut est ignoré par une autre version, la seule conséquence est
+    que la barre d'outils reste visible, pas un plantage du dashboard.
+    """
+    widget = go.FigureWidget(fig.data, fig.layout)
+    try:
+        widget._config = {"displayModeBar": False}
+    except Exception:
+        pass
+    return widget
+
+
 ANNONCES, RUNS, EXPORTE_LE = _charger_donnees()
 
 GROUPES = sorted(ANNONCES["groupe_nom"].dropna().unique()) if not ANNONCES.empty else []
@@ -63,8 +125,27 @@ PRIX_MAX = int(ANNONCES["prix_fcfa"].max()) if not ANNONCES.empty and ANNONCES["
 # Interface
 # --------------------------------------------------------------------------- #
 
+# Retouches CSS minimales : pas d'icônes/emojis, juste de la lisibilité
+# (titres de KPI en petites majuscules espacées, en-têtes de carte teintés
+# avec la couleur principale de la palette ci-dessus). Sélecteurs vérifiés
+# contre le SCSS de bslib fourni par le paquet shiny installé localement.
+STYLE_PERSONNALISE = ui.tags.style(
+    """
+    .bslib-value-box .value-box-title {
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        font-size: 0.75rem;
+        opacity: 0.8;
+    }
+    .card-header {
+        font-weight: 600;
+        color: #2C5F8A;
+    }
+    """
+)
+
 barre_laterale = ui.sidebar(
-    ui.markdown(f"*Dernier export : {EXPORTE_LE}*"),
+    ui.markdown(f"*Dernier export : {_formater_horodatage(EXPORTE_LE)}*"),
     ui.input_selectize(
         "groupes", "Groupes", choices=GROUPES, selected=GROUPES, multiple=True
     ),
@@ -86,12 +167,10 @@ barre_laterale = ui.sidebar(
 panneau_vue_ensemble = ui.nav_panel(
     "Vue d'ensemble",
     ui.layout_columns(
-        ui.value_box("Annonces valides", ui.output_text("kpi_total"), showcase=ui.tags.span("🏠")),
-        ui.value_box("Groupes couverts", ui.output_text("kpi_groupes"), showcase=ui.tags.span("📍")),
-        ui.value_box(
-            "Ancienneté max couverte", ui.output_text("kpi_anciennete"), showcase=ui.tags.span("📅")
-        ),
-        ui.value_box("Dernier run", ui.output_text("kpi_dernier_run"), showcase=ui.tags.span("⏱️")),
+        ui.value_box("Annonces valides", ui.output_text("kpi_total")),
+        ui.value_box("Groupes couverts", ui.output_text("kpi_groupes")),
+        ui.value_box("Ancienneté max couverte", ui.output_text("kpi_anciennete")),
+        ui.output_ui("kpi_dernier_run_box"),
         col_widths=[3, 3, 3, 3],
     ),
     ui.layout_columns(
@@ -120,7 +199,14 @@ panneau_donnees = ui.nav_panel(
     "Données",
     ui.layout_columns(
         ui.card(ui.card_header("Répartition par type de bien"), output_widget("graphe_type_bien")),
-        ui.card(ui.card_header("Distribution des prix"), output_widget("graphe_prix")),
+        ui.card(
+            ui.card_header("Distribution des prix"),
+            output_widget("graphe_prix"),
+            ui.p(
+                ui.output_text("graphe_prix_note"),
+                class_="text-muted small mb-0 mt-1",
+            ),
+        ),
         col_widths=[6, 6],
     ),
     ui.card(ui.card_header("Annonces filtrées"), ui.output_data_frame("table_annonces")),
@@ -128,6 +214,7 @@ panneau_donnees = ui.nav_panel(
 
 app_ui = ui.page_sidebar(
     barre_laterale,
+    STYLE_PERSONNALISE,
     ui.navset_card_tab(panneau_vue_ensemble, panneau_runs, panneau_donnees),
     title="Annonces foncières Ouagadougou - suivi de la collecte",
     fillable=True,
@@ -190,12 +277,30 @@ def server(input, output, session):  # noqa: A002 - noms imposés par l'API Shin
         jours = (pd.Timestamp.now(tz="UTC") - dates.min()).days
         return f"{jours} j"
 
-    @render.text
-    def kpi_dernier_run():
+    @render.ui
+    def kpi_dernier_run_box():
+        """Value box du dernier run, en rouge si 0 annonce valide.
+
+        Un run à 0 valide peut simplement signifier qu'aucune nouvelle
+        annonce n'est parue - mais peut aussi trahir une session Facebook
+        expirée ou un sélecteur DOM cassé (déjà vu sur ce pipeline). Le
+        signal visuel sert à attirer l'œil sans qu'il faille aller lire les
+        logs GitHub Actions pour s'en rendre compte.
+        """
         if RUNS.empty:
-            return "aucun run enregistré"
+            return ui.value_box("Dernier run", "aucun run enregistré")
+
         dernier = RUNS.sort_values("horodatage").iloc[-1]
-        return f"{dernier['mode']} - {int(dernier['nb_valides'])} valide(s)"
+        nb_valides = int(dernier["nb_valides"]) if pd.notna(dernier["nb_valides"]) else 0
+        contenu = ui.div(
+            ui.div(str(dernier["mode"]), style="font-size: 0.95rem; opacity: 0.8;"),
+            ui.div(
+                f"{nb_valides} valide(s)",
+                style="font-size: 1.5rem; font-weight: 600; line-height: 1.2;",
+            ),
+        )
+        theme = "bg-danger" if nb_valides == 0 else None
+        return ui.value_box("Dernier run", contenu, theme=theme)
 
     # --- Graphiques ------------------------------------------------------ #
 
@@ -203,51 +308,60 @@ def server(input, output, session):  # noqa: A002 - noms imposés par l'API Shin
     def graphe_par_groupe():
         df = annonces_filtrees()
         if df.empty:
-            return px.bar(title="Aucune donnée")
+            return _widget(px.bar(title="Aucune donnée"))
         compte = df["groupe_nom"].value_counts().reset_index()
         compte.columns = ["groupe_nom", "nb_annonces"]
-        return px.bar(
+        compte = _ajouter_nom_court(compte)
+        fig = px.bar(
             compte.sort_values("nb_annonces"),
             x="nb_annonces",
-            y="groupe_nom",
+            y="groupe_nom_court",
             orientation="h",
-            labels={"nb_annonces": "Annonces valides", "groupe_nom": ""},
+            hover_name="groupe_nom",
+            labels={"nb_annonces": "Annonces valides", "groupe_nom_court": ""},
         )
+        fig.update_yaxes(automargin=True)
+        return _widget(fig)
 
     @render_widget
     def graphe_couverture():
         df = annonces_filtrees().dropna(subset=["date_publication"])
         if df.empty:
-            return px.scatter(title="Aucune donnée datée")
+            return _widget(px.scatter(title="Aucune donnée datée"))
         plus_ancienne = df.groupby("groupe_nom")["date_publication"].min().reset_index()
         aujourdhui = pd.Timestamp.now(tz="UTC")
         plus_ancienne["jours_couverts"] = (aujourdhui - plus_ancienne["date_publication"]).dt.days
-        return px.bar(
+        plus_ancienne = _ajouter_nom_court(plus_ancienne)
+        fig = px.bar(
             plus_ancienne.sort_values("jours_couverts"),
             x="jours_couverts",
-            y="groupe_nom",
+            y="groupe_nom_court",
             orientation="h",
-            labels={"jours_couverts": "Jours en arrière atteints", "groupe_nom": ""},
+            hover_name="groupe_nom",
+            labels={"jours_couverts": "Jours en arrière atteints", "groupe_nom_court": ""},
         )
+        fig.update_yaxes(automargin=True)
+        return _widget(fig)
 
     @render_widget
     def graphe_runs():
         df = runs_filtres()
         if df.empty:
-            return px.line(title="Aucun run")
-        return px.bar(
+            return _widget(px.bar(title="Aucun run"))
+        fig = px.bar(
             df.sort_values("horodatage"),
             x="horodatage",
             y="nb_valides",
             color="mode",
             labels={"horodatage": "Date du run", "nb_valides": "Annonces valides"},
         )
+        return _widget(fig)
 
     @render_widget
     def graphe_conversion():
         df = runs_filtres().sort_values("horodatage").copy()
         if df.empty:
-            return px.line(title="Aucun run")
+            return _widget(px.line(title="Aucun run"))
         df["taux_candidats"] = (df["nb_candidats"] / df["nb_posts_bruts"]).fillna(0)
         df["taux_valides"] = (df["nb_valides"] / df["nb_candidats"]).fillna(0)
         long = df.melt(
@@ -256,23 +370,51 @@ def server(input, output, session):  # noqa: A002 - noms imposés par l'API Shin
             var_name="etape",
             value_name="taux",
         )
-        return px.line(long, x="horodatage", y="taux", color="etape", markers=True)
+        fig = px.line(long, x="horodatage", y="taux", color="etape", markers=True)
+        return _widget(fig)
 
     @render_widget
     def graphe_type_bien():
         df = annonces_filtrees()
         if df.empty or df["type_bien"].dropna().empty:
-            return px.pie(title="Aucune donnée")
+            return _widget(px.pie(title="Aucune donnée"))
         compte = df["type_bien"].value_counts().reset_index()
         compte.columns = ["type_bien", "nb"]
-        return px.pie(compte, names="type_bien", values="nb")
+        fig = px.pie(compte, names="type_bien", values="nb")
+        return _widget(fig)
+
+    # --- Distribution des prix : un ou quelques biens à prix extrême ------ #
+    # écrasaient tout le reste de l'histogramme contre l'axe des zéros.
+    # L'affichage exclut désormais le 3% le plus cher (percentile 97), avec
+    # le nombre exact d'exclusions rappelé sous le graphique - les données
+    # ne sont pas perdues, elles restent visibles dans le tableau plus bas.
+
+    def _borne_prix_affichage(df: pd.DataFrame) -> float:
+        return df["prix_fcfa"].quantile(0.97)
 
     @render_widget
     def graphe_prix():
         df = annonces_filtrees().dropna(subset=["prix_fcfa"])
         if df.empty:
-            return px.histogram(title="Aucune donnée de prix")
-        return px.histogram(df, x="prix_fcfa", nbins=30, labels={"prix_fcfa": "Prix (FCFA)"})
+            return _widget(px.histogram(title="Aucune donnée de prix"))
+        borne = _borne_prix_affichage(df)
+        df_affiche = df[df["prix_fcfa"] <= borne]
+        fig = px.histogram(df_affiche, x="prix_fcfa", nbins=30, labels={"prix_fcfa": "Prix (FCFA)"})
+        return _widget(fig)
+
+    @render.text
+    def graphe_prix_note():
+        df = annonces_filtrees().dropna(subset=["prix_fcfa"])
+        if df.empty:
+            return ""
+        borne = _borne_prix_affichage(df)
+        nb_exclus = int((df["prix_fcfa"] > borne).sum())
+        if nb_exclus == 0:
+            return ""
+        return (
+            f"{nb_exclus} annonce(s) à prix extrême exclue(s) de l'affichage "
+            "(au-delà du 97e centile) - toujours visibles dans le tableau ci-dessous."
+        )
 
     # --- Table ------------------------------------------------------------ #
 
@@ -291,7 +433,9 @@ def server(input, output, session):  # noqa: A002 - noms imposés par l'API Shin
         df = annonces_filtrees()
         if df.empty:
             return render.DataGrid(pd.DataFrame(columns=colonnes))
-        return render.DataGrid(df[colonnes], filters=True, height="500px")
+        df_affiche = df[colonnes].copy()
+        df_affiche["date_publication"] = df_affiche["date_publication"].dt.strftime("%d/%m/%Y").fillna("")
+        return render.DataGrid(df_affiche, filters=True, height="500px")
 
 
 app = App(app_ui, server)
