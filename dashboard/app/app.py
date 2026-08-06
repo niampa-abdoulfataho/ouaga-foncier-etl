@@ -79,6 +79,17 @@ def _ajouter_nom_court(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _formater_milliers(valeur: object) -> str:
+    """Formate un nombre avec séparateur de milliers (espace), vide si NA.
+
+    Utilisé pour la table "Annonces filtrées" (prix_fcfa, superficie_m2) -
+    12000000 est illisible d'un coup d'œil, 12 000 000 se lit directement.
+    """
+    if pd.isna(valeur):
+        return ""
+    return f"{valeur:,.0f}".replace(",", " ")
+
+
 def _formater_horodatage(valeur: str) -> str:
     """Formate un horodatage ISO 8601 en JJ/MM/AAAA HH:MM UTC.
 
@@ -433,8 +444,26 @@ def server(input, output, session):  # noqa: A002 - noms imposés par l'API Shin
         df = annonces_filtrees()
         if df.empty:
             return render.DataGrid(pd.DataFrame(columns=colonnes))
-        df_affiche = df[colonnes].copy()
+
+        # Tri par date de publication décroissante (annonces récentes en
+        # premier) - NaT (date non extraite lors du scraping) relégué en
+        # fin de liste plutôt qu'en tête, où il serait pris pour une
+        # annonce fraîche.
+        df_affiche = df[colonnes].sort_values(
+            "date_publication", ascending=False, na_position="last"
+        ).copy()
         df_affiche["date_publication"] = df_affiche["date_publication"].dt.strftime("%d/%m/%Y").fillna("")
+
+        # Séparateurs de milliers pour la lisibilité (12 000 000 plutôt que
+        # 12000000). Effet de bord assumé : ces colonnes deviennent du
+        # texte, donc leur filtre de colonne (plage numérique min/max)
+        # devient un filtre texte simple. Acceptable pour prix_fcfa (déjà
+        # filtrable via le curseur de la barre latérale) ; plus discutable
+        # pour superficie_m2, qui n'a pas d'équivalent ailleurs - à revoir
+        # si ce filtre s'avère utile à l'usage.
+        for colonne in ("prix_fcfa", "superficie_m2"):
+            df_affiche[colonne] = df_affiche[colonne].apply(_formater_milliers)
+
         return render.DataGrid(df_affiche, filters=True, height="500px")
 
 
