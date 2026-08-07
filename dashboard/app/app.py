@@ -58,6 +58,16 @@ def _charger_donnees() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
         annonces["date_publication"] = pd.to_datetime(
             annonces["date_publication"], errors="coerce", utc=True
         )
+        # premiere_collecte (TIMESTAMPTZ NOT NULL en base, voir processor.py
+        # SCHEMA_SQL) : date/heure RÉELLE d'enregistrement en base, à ne pas
+        # confondre avec date_publication (date du post sur Facebook, peut
+        # être ancienne même pour une annonce collectée aujourd'hui via un
+        # run backfill). Utilisée pour le graphique "Collecte quotidienne"
+        # ci-dessous - c'est la seule colonne qui reflète fidèlement QUAND le
+        # pipeline a effectivement ajouté chaque annonce en base.
+        annonces["premiere_collecte"] = pd.to_datetime(
+            annonces["premiere_collecte"], errors="coerce", utc=True
+        )
 
     runs = pd.DataFrame(brut.get("runs", []))
     if not runs.empty:
@@ -139,12 +149,20 @@ ANNONCES, RUNS, RUNS_CI, EXPORTE_LE = _charger_donnees()
 GROUPES = sorted(ANNONCES["groupe_nom"].dropna().unique()) if not ANNONCES.empty else []
 DATE_MIN = ANNONCES["date_publication"].min().date() if not ANNONCES.empty else date.today()
 DATE_MAX = ANNONCES["date_publication"].max().date() if not ANNONCES.empty else date.today()
-PRIX_MAX = int(ANNONCES["prix_fcfa"].max()) if not ANNONCES.empty and ANNONCES["prix_fcfa"].notna().any() else 0
 
-# Bornes pour le filtre de plage du graphique journalier de collecte
-# (panneau "Historique des runs") - basées sur la date d'EXÉCUTION du run
-# (horodatage), pas la date de publication des annonces : l'objet de ce
-# graphique est de suivre la collecte elle-même, pas le contenu collecté.
+# Bornes pour le filtre de plage du graphique "Collecte quotidienne" - basées
+# sur premiere_collecte (date/heure réelle d'enregistrement en base), pas
+# date_publication (voir commentaire dans _charger_donnees).
+_PREMIERE_COLLECTE_VALIDES = (
+    ANNONCES["premiere_collecte"].dropna() if not ANNONCES.empty else pd.Series(dtype="datetime64[ns, UTC]")
+)
+DATE_MIN_COLLECTE = _PREMIERE_COLLECTE_VALIDES.min().date() if not _PREMIERE_COLLECTE_VALIDES.empty else date.today()
+DATE_MAX_COLLECTE = _PREMIERE_COLLECTE_VALIDES.max().date() if not _PREMIERE_COLLECTE_VALIDES.empty else date.today()
+
+# Bornes pour les filtres de plage des histogrammes daily/backfill (panneau
+# "Historique des runs") - basées sur la date d'EXÉCUTION du run
+# (horodatage) : seule la table `runs` porte l'information de mode
+# (daily/backfill), absente de la table `annonces`.
 DATE_MIN_RUNS = RUNS["horodatage"].min().date() if not RUNS.empty else date.today()
 DATE_MAX_RUNS = RUNS["horodatage"].max().date() if not RUNS.empty else date.today()
 
@@ -180,15 +198,6 @@ barre_laterale = ui.sidebar(
     ui.input_date_range(
         "periode", "Période de publication", start=DATE_MIN, end=DATE_MAX
     ),
-    ui.input_slider(
-        "prix", "Prix (FCFA)", min=0, max=max(PRIX_MAX, 1), value=(0, max(PRIX_MAX, 1)), step=100_000
-    ),
-    ui.input_checkbox_group(
-        "modes_runs",
-        "Historique des runs - mode",
-        choices=["daily", "backfill"],
-        selected=["daily", "backfill"],
-    ),
     width=320,
 )
 
@@ -197,46 +206,62 @@ panneau_vue_ensemble = ui.nav_panel(
     ui.layout_columns(
         ui.value_box("Annonces valides", ui.output_text("kpi_total")),
         ui.value_box("Groupes couverts", ui.output_text("kpi_groupes")),
-        ui.value_box("Ancienneté max couverte", ui.output_text("kpi_anciennete")),
+        ui.value_box("Annonce la plus ancienne couverte", ui.output_text("kpi_anciennete")),
         ui.output_ui("kpi_dernier_run_box"),
         col_widths=[3, 3, 3, 3],
     ),
-    ui.layout_columns(
-        ui.card(ui.card_header("Annonces par groupe"), output_widget("graphe_par_groupe")),
-        ui.card(
-            ui.card_header("Couverture temporelle par groupe (date la plus ancienne)"),
-            output_widget("graphe_couverture"),
-        ),
-        col_widths=[6, 6],
+    ui.card(
+        ui.card_header("Annonces par groupe"),
+        output_widget("graphe_par_groupe"),
+        full_screen=True,
     ),
 )
 
 panneau_runs = ui.nav_panel(
     "Historique des runs",
+    ui.output_ui("alerte_run_echoue"),
     ui.card(
-        ui.card_header("Collecte quotidienne (annonces valides par jour)"),
+        ui.card_header("Collecte quotidienne (annonces enregistrées en base)"),
         ui.input_date_range(
-            "periode_collecte",
+            "periode_collecte_db",
+            "Plage de dates",
+            start=DATE_MIN_COLLECTE,
+            end=DATE_MAX_COLLECTE,
+        ),
+        output_widget("graphe_collecte_db"),
+        full_screen=True,
+    ),
+    ui.card(
+        ui.card_header("Collecte - mode daily"),
+        ui.input_date_range(
+            "periode_daily",
             "Plage de dates",
             start=DATE_MIN_RUNS,
             end=DATE_MAX_RUNS,
         ),
-        ui.output_ui("alerte_run_echoue"),
-        output_widget("graphe_collecte_journaliere"),
+        output_widget("graphe_collecte_daily"),
+        full_screen=True,
     ),
     ui.card(
-        ui.card_header("Annonces valides par run (daily vs backfill)"),
-        output_widget("graphe_runs"),
-    ),
-    ui.card(
-        ui.card_header("Taux de conversion par run (candidats/bruts, valides/candidats)"),
-        output_widget("graphe_conversion"),
+        ui.card_header("Collecte - mode backfill"),
+        ui.input_date_range(
+            "periode_backfill",
+            "Plage de dates",
+            start=DATE_MIN_RUNS,
+            end=DATE_MAX_RUNS,
+        ),
+        output_widget("graphe_collecte_backfill"),
+        full_screen=True,
     ),
 )
 
 panneau_donnees = ui.nav_panel(
     "Données",
-    ui.card(ui.card_header("Annonces filtrées"), ui.output_data_frame("table_annonces")),
+    ui.card(
+        ui.card_header("Annonces filtrées"),
+        ui.output_data_frame("table_annonces"),
+        full_screen=True,
+    ),
 )
 
 app_ui = ui.page_sidebar(
@@ -272,38 +297,57 @@ def server(input, output, session):  # noqa: A002 - noms imposés par l'API Shin
             )
         ]
 
-        prix_min, prix_max = input.prix()
-        df = df[df["prix_fcfa"].isna() | df["prix_fcfa"].between(prix_min, prix_max)]
-
         return df
 
-    @reactive.calc
-    def runs_filtres() -> pd.DataFrame:
-        if RUNS.empty:
-            return RUNS
-        modes = input.modes_runs() or []
-        return RUNS[RUNS["mode"].isin(modes)]
+    def _histogramme_run_par_mode(mode: str, debut: date, fin: date) -> pd.DataFrame:
+        """Agrège la table `runs` par jour d'exécution pour un mode donné
+        (daily ou backfill), sur la plage [debut, fin] fournie par le filtre
+        de plage propre à chaque histogramme.
 
-    @reactive.calc
-    def collecte_journaliere() -> pd.DataFrame:
-        """Agrège les runs par jour (date d'exécution) pour le graphique de
-        suivi de collecte - contrairement à `runs_filtres`, ceci peut
-        fusionner plusieurs runs du même jour (ex. daily + un backfill
-        ponctuel) en une seule barre, ce qui est le but : suivre le volume
-        collecté par jour, pas run par run.
+        Source `runs` (et non `annonces`) : c'est la SEULE table qui porte
+        l'information de mode - `annonces` n'a pas de colonne équivalente
+        (voir SCHEMA_SQL dans processor.py, table `annonces`).
         """
         if RUNS.empty:
             return pd.DataFrame(columns=["jour", "nb_valides"])
-        modes = input.modes_runs() or []
-        debut, fin = input.periode_collecte()
-        df = RUNS[RUNS["mode"].isin(modes)].copy()
-        df = df[
-            (df["horodatage"].dt.date >= debut) & (df["horodatage"].dt.date <= fin)
-        ]
+        df = RUNS[RUNS["mode"] == mode].copy()
+        df = df[(df["horodatage"].dt.date >= debut) & (df["horodatage"].dt.date <= fin)]
         if df.empty:
             return pd.DataFrame(columns=["jour", "nb_valides"])
         df["jour"] = df["horodatage"].dt.date
         return df.groupby("jour", as_index=False)["nb_valides"].sum()
+
+    @reactive.calc
+    def collecte_daily() -> pd.DataFrame:
+        debut, fin = input.periode_daily()
+        return _histogramme_run_par_mode("daily", debut, fin)
+
+    @reactive.calc
+    def collecte_backfill() -> pd.DataFrame:
+        debut, fin = input.periode_backfill()
+        return _histogramme_run_par_mode("backfill", debut, fin)
+
+    @reactive.calc
+    def collecte_db_journaliere() -> pd.DataFrame:
+        """Agrège la table `annonces` par jour de `premiere_collecte` -
+        source de vérité pour "combien d'annonces ont réellement été
+        enregistrées en base tel jour", plutôt que le nombre auto-rapporté
+        par chaque run (`runs.nb_valides`), qui peut diverger en cas
+        d'upsert (ON CONFLICT DO UPDATE - une annonce déjà vue et mise à
+        jour n'est PAS une nouvelle collecte au sens de ce graphique, mais
+        aurait pu compter dans nb_valides selon le run l'ayant retraitée).
+        """
+        if ANNONCES.empty or "premiere_collecte" not in ANNONCES.columns:
+            return pd.DataFrame(columns=["jour", "nb_annonces"])
+        debut, fin = input.periode_collecte_db()
+        df = ANNONCES.dropna(subset=["premiere_collecte"]).copy()
+        df = df[
+            (df["premiere_collecte"].dt.date >= debut) & (df["premiere_collecte"].dt.date <= fin)
+        ]
+        if df.empty:
+            return pd.DataFrame(columns=["jour", "nb_annonces"])
+        df["jour"] = df["premiere_collecte"].dt.date
+        return df.groupby("jour", as_index=False).size().rename(columns={"size": "nb_annonces"})
 
     # --- KPIs ---------------------------------------------------------- #
 
@@ -322,8 +366,7 @@ def server(input, output, session):  # noqa: A002 - noms imposés par l'API Shin
         dates = df["date_publication"].dropna()
         if dates.empty:
             return "n/d"
-        jours = (pd.Timestamp.now(tz="UTC") - dates.min()).days
-        return f"{jours} j"
+        return dates.min().strftime("%d/%m/%Y %H:%M UTC")
 
     @render.ui
     def kpi_dernier_run_box():
@@ -376,15 +419,41 @@ def server(input, output, session):  # noqa: A002 - noms imposés par l'API Shin
     # --- Graphiques ------------------------------------------------------ #
 
     @render_widget
-    def graphe_collecte_journaliere():
-        df = collecte_journaliere()
+    def graphe_collecte_db():
+        df = collecte_db_journaliere()
         if df.empty:
-            return _widget(px.bar(title="Aucun run sur cette plage"))
+            return _widget(px.bar(title="Aucune annonce enregistrée sur cette plage"))
+        fig = px.bar(
+            df,
+            x="jour",
+            y="nb_annonces",
+            labels={"jour": "Jour", "nb_annonces": "Annonces enregistrées en base"},
+        )
+        return _widget(fig)
+
+    @render_widget
+    def graphe_collecte_daily():
+        df = collecte_daily()
+        if df.empty:
+            return _widget(px.bar(title="Aucun run daily sur cette plage"))
         fig = px.bar(
             df,
             x="jour",
             y="nb_valides",
-            labels={"jour": "Jour", "nb_valides": "Annonces valides collectées"},
+            labels={"jour": "Jour", "nb_valides": "Annonces valides (daily)"},
+        )
+        return _widget(fig)
+
+    @render_widget
+    def graphe_collecte_backfill():
+        df = collecte_backfill()
+        if df.empty:
+            return _widget(px.bar(title="Aucun run backfill sur cette plage"))
+        fig = px.bar(
+            df,
+            x="jour",
+            y="nb_valides",
+            labels={"jour": "Jour", "nb_valides": "Annonces valides (backfill)"},
         )
         return _widget(fig)
 
@@ -407,55 +476,12 @@ def server(input, output, session):  # noqa: A002 - noms imposés par l'API Shin
         fig.update_yaxes(automargin=True)
         return _widget(fig)
 
-    @render_widget
-    def graphe_couverture():
-        df = annonces_filtrees().dropna(subset=["date_publication"])
-        if df.empty:
-            return _widget(px.scatter(title="Aucune donnée datée"))
-        plus_ancienne = df.groupby("groupe_nom")["date_publication"].min().reset_index()
-        aujourdhui = pd.Timestamp.now(tz="UTC")
-        plus_ancienne["jours_couverts"] = (aujourdhui - plus_ancienne["date_publication"]).dt.days
-        plus_ancienne = _ajouter_nom_court(plus_ancienne)
-        fig = px.bar(
-            plus_ancienne.sort_values("jours_couverts"),
-            x="jours_couverts",
-            y="groupe_nom_court",
-            orientation="h",
-            hover_name="groupe_nom",
-            labels={"jours_couverts": "Jours en arrière atteints", "groupe_nom_court": ""},
-        )
-        fig.update_yaxes(automargin=True)
-        return _widget(fig)
-
-    @render_widget
-    def graphe_runs():
-        df = runs_filtres()
-        if df.empty:
-            return _widget(px.bar(title="Aucun run"))
-        fig = px.bar(
-            df.sort_values("horodatage"),
-            x="horodatage",
-            y="nb_valides",
-            color="mode",
-            labels={"horodatage": "Date du run", "nb_valides": "Annonces valides"},
-        )
-        return _widget(fig)
-
-    @render_widget
-    def graphe_conversion():
-        df = runs_filtres().sort_values("horodatage").copy()
-        if df.empty:
-            return _widget(px.line(title="Aucun run"))
-        df["taux_candidats"] = (df["nb_candidats"] / df["nb_posts_bruts"]).fillna(0)
-        df["taux_valides"] = (df["nb_valides"] / df["nb_candidats"]).fillna(0)
-        long = df.melt(
-            id_vars="horodatage",
-            value_vars=["taux_candidats", "taux_valides"],
-            var_name="etape",
-            value_name="taux",
-        )
-        fig = px.line(long, x="horodatage", y="taux", color="etape", markers=True)
-        return _widget(fig)
+    # NOTE (2026-08-07) : le graphique "Couverture temporelle par groupe"
+    # (jours en arrière atteints par groupe) a été retiré à la demande de
+    # l'utilisateur ("pas important"). Les graphiques "Annonces valides par
+    # run" et "Taux de conversion par run" ont été remplacés par les 3
+    # histogrammes ci-dessus (collecte DB globale + daily/backfill,
+    # filtrables indépendamment).
 
     # NOTE (2026-08-07) : les graphiques "Répartition par type de bien" et
     # "Distribution des prix" ont été retirés à la demande explicite de
