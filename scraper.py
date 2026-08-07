@@ -1046,10 +1046,17 @@ async def scraper_groupe(
             tache.add_done_callback(taches_en_cours.discard)
 
     page.on("response", _sur_reponse)
-    url_groupe = f"{config.WEB_FACEBOOK_BASE_URL}/groups/{groupe.id}/"
+    # Groupe : id numérique fiable -> URL reconstruite en dur (comportement
+    # historique). Page : pas d'id numérique fiable (slug arbitraire, ex.
+    # "PerfectorImmobilier") -> on utilise directement l'URL stockée dans
+    # groups.csv plutôt que de tenter de la reconstruire.
+    if groupe.type == "page":
+        url_groupe = groupe.url
+    else:
+        url_groupe = f"{config.WEB_FACEBOOK_BASE_URL}/groups/{groupe.id}/"
 
     try:
-        logger.info("Ouverture du groupe %s (%s)", groupe.nom, url_groupe)
+        logger.info("Ouverture du %s %s (%s)", groupe.type, groupe.nom, url_groupe)
         await page.goto(url_groupe, wait_until="domcontentloaded")
         await detecter_blocage_ou_session_expiree(page)
 
@@ -1099,7 +1106,16 @@ async def scraper_groupe(
             debut_capture = len(posts_captures)
             # Scroll page-niveau (window), plus fiable en headless que
             # page.mouse.wheel dont l'effet dépend de la position du curseur.
-            await page.evaluate("window.scrollBy(0, window.innerHeight * 3)")
+            # Distance variable (voir config.SCROLL_DISTANCE_MULTIPLICATEUR_MIN/MAX) :
+            # un multiplicateur fixe à chaque étape était un signal comportemental
+            # répétitif facile à détecter.
+            multiplicateur_scroll = random.uniform(
+                config.SCROLL_DISTANCE_MULTIPLICATEUR_MIN,
+                config.SCROLL_DISTANCE_MULTIPLICATEUR_MAX,
+            )
+            await page.evaluate(
+                "window.scrollBy(0, window.innerHeight * %r)" % multiplicateur_scroll
+            )
             await asyncio.sleep(
                 random.uniform(config.PAGE_DELAY_MIN_S, config.PAGE_DELAY_MAX_S)
                 * delai_multiplicateur

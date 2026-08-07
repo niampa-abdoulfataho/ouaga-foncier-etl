@@ -93,24 +93,36 @@ def configurer_logging(niveau: int = logging.INFO) -> logging.Logger:
 # --------------------------------------------------------------------------- #
 
 
+TYPES_GROUPE_VALIDES = ("groupe", "page")
+
+
 @dataclass(frozen=True)
 class Groupe:
-    """Représente un groupe Facebook cible."""
+    """Représente une cible Facebook à scraper : un groupe ou une page.
+
+    `type` distingue les deux car leur URL de fil d'actualité se construit
+    différemment (voir `scraper.scraper_groupe`) :
+    - "groupe" : id numérique Facebook -> URL reconstruite en dur
+      (`WEB_FACEBOOK_BASE_URL/groups/{id}/`).
+    - "page" : pas d'id numérique fiable (slug arbitraire) -> `url` stockée
+      est utilisée telle quelle, sans reconstruction.
+    """
 
     id: str
     nom: str
     url: str
     actif: bool = True
+    type: str = "groupe"
 
 
 def charger_groupes(chemin: Path = GROUPS_CSV_PATH, limite: int | None = None) -> list[Groupe]:
-    """Charge la liste des groupes depuis groups.csv (source unique de vérité).
+    """Charge la liste des groupes/pages depuis groups.csv (source unique de vérité).
 
-    IMPORTANT : cette liste n'est PAS hardcodée dans le code. Le fichier
-    Groupe.xlsx fourni à la racine de "F:\\Scraping Facebook" n'a pas pu être
-    lu automatiquement lors de la génération de ce projet (accès shell
-    indisponible dans mon environnement à ce moment-là). `groups.csv` contient
-    donc des lignes TODO à compléter/valider manuellement - voir README.md.
+    Intègre depuis le 2026-08-07 les groupes et pages fournis dans
+    "F:\\Scraping Facebook\\Groupe.xlsx" (passage de 13 à 25 cibles suivies :
+    23 groupes + 2 pages Facebook). La colonne `type` ("groupe" ou "page")
+    distingue les deux ; absente ou vide, elle vaut "groupe" par défaut pour
+    rester compatible avec les lignes historiques du CSV.
 
     Args:
         chemin: chemin vers le fichier CSV des groupes.
@@ -119,7 +131,7 @@ def charger_groupes(chemin: Path = GROUPS_CSV_PATH, limite: int | None = None) -
 
     Raises:
         FileNotFoundError: si groups.csv est absent.
-        ValueError: si le CSV est vide ou mal formé.
+        ValueError: si le CSV est vide, mal formé, ou contient un `type` invalide.
     """
     if not chemin.exists():
         raise FileNotFoundError(
@@ -139,12 +151,19 @@ def charger_groupes(chemin: Path = GROUPS_CSV_PATH, limite: int | None = None) -
         for ligne in lecteur:
             if ligne["id"].strip().upper().startswith("TODO"):
                 continue  # ligne placeholder non complétée : on l'ignore silencieusement
+            type_brut = (ligne.get("type") or "").strip().lower() or "groupe"
+            if type_brut not in TYPES_GROUPE_VALIDES:
+                raise ValueError(
+                    f"type invalide '{type_brut}' pour la ligne id={ligne['id']!r} dans "
+                    f"{chemin} : attendu un parmi {TYPES_GROUPE_VALIDES}"
+                )
             groupes.append(
                 Groupe(
                     id=ligne["id"].strip(),
                     nom=ligne["nom"].strip(),
                     url=ligne["url"].strip(),
                     actif=ligne["actif"].strip().lower() in ("1", "true", "vrai", "oui"),
+                    type=type_brut,
                 )
             )
 
@@ -389,6 +408,18 @@ MBASIC_USER_AGENT = (
 
 PAGE_DELAY_MIN_S = 2.0  # délai entre deux étapes de scroll (remplace l'ancien délai de pagination par lien)
 PAGE_DELAY_MAX_S = 5.0
+
+# Distance de scroll par étape, exprimée en multiple de `window.innerHeight`.
+# Auparavant fixe (`* 3` en dur dans scraper.py) : une distance identique à
+# chaque étape, à intervalle régulier, est un signal comportemental répétitif
+# facilement détectable. Rendue variable (tirage uniforme à chaque étape,
+# même logique que PAGE_DELAY_MIN_S/MAX_S ci-dessus) pour s'en rapprocher
+# d'un comportement humain. Bornes choisies empiriquement : en dessous de 1.5
+# le scroll avance trop peu pour déclencher le chargement du fil suivant de
+# façon fiable ; au-dessus de 4.5 on s'approche d'un saut brutal, plus proche
+# d'un comportement de bot que d'un utilisateur qui lit en scrollant.
+SCROLL_DISTANCE_MULTIPLICATEUR_MIN = 1.5
+SCROLL_DISTANCE_MULTIPLICATEUR_MAX = 4.5
 PAUSE_ENTRE_BATCHES_MIN_S = 15.0
 PAUSE_ENTRE_BATCHES_MAX_S = 45.0
 

@@ -24,6 +24,12 @@ permissions:
   contents: read
   pages: write
   id-token: write
+  # Lecture seule sur l'historique des runs du workflow de scraping, pour
+  # que dashboard/export_data.py puisse afficher une alerte en cas d'échec
+  # récent - sans ce scope explicite, GITHUB_TOKEN n'a AUCUN accès à
+  # l'API Actions dès qu'un bloc `permissions:` est présent (tout scope
+  # non listé retombe à `none`, ce n'est pas le défaut habituel).
+  actions: read
 
 # Un seul déploiement Pages actif à la fois - un déploiement plus récent
 # annule le précédent plutôt que de les empiler inutilement.
@@ -59,6 +65,11 @@ jobs:
       - name: "Export des données depuis la base maître"
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          # GITHUB_TOKEN : jeton auto-généré par Actions (pas un secret à
+          # créer manuellement), portée limitée par le bloc `permissions:`
+          # ci-dessus. GITHUB_REPOSITORY ("owner/repo") est déjà injecté
+          # automatiquement par le runner, pas besoin de le déclarer ici.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python dashboard/export_data.py
 
       - name: "Build Shinylive (WebAssembly)"

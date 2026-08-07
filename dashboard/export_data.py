@@ -31,6 +31,8 @@ import json
 import logging
 import os
 import sys
+import urllib.error
+import urllib.request
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -63,6 +65,74 @@ COLONNES_ANNONCES = [
 ]
 
 COLONNES_RUNS = ["horodatage", "mode", "nb_posts_bruts", "nb_candidats", "nb_valides"]
+
+# Nom du fichier workflow tel qu'affiché par l'API GitHub Actions (voir
+# .github/workflows/daily_scraper.yml) - utilisé pour cibler uniquement les
+# runs du scraping, pas ceux de deploy_dashboard.yml ou d'autres workflows
+# du dépôt.
+WORKFLOW_SCRAPER = "daily_scraper.yml"
+NB_RUNS_CI_MAX = 15  # suffisant pour repérer un échec récent sans surcharger l'export
+TIMEOUT_API_CI_S = 15
+
+
+def _recuperer_runs_ci() -> list[dict[str, Any]]:
+    """Interroge l'API REST GitHub Actions pour l'historique des runs du
+    workflow de scraping (succès/échec), afin d'alerter sur le dashboard en
+    cas d'échec récent - le pipeline lui-même n'enregistre RIEN en base sur
+    les chemins d'échec (voir main.py : chaque exception retourne avant
+    l'appel à enregistrer_run()), donc c'est la seule source fiable de ce
+    signal sans modifier le schéma de la base.
+
+    Best-effort et non-bloquant : `GITHUB_TOKEN`/`GITHUB_REPOSITORY` sont
+    absents en local (uniquement injectés par GitHub Actions), et l'API peut
+    échouer (réseau, rate limit) - dans tous ces cas on retourne une liste
+    vide plutôt que de faire échouer tout l'export du dashboard pour une
+    fonctionnalité annexe.
+    """
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    depot = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    if not token or not depot:
+        logger.warning(
+            "GITHUB_TOKEN/GITHUB_REPOSITORY absents - statut CI des runs non exporté "
+            "(normal en local ; doit être présent en CI, voir permissions dans "
+            "deploy_dashboard.yml)."
+        )
+        return []
+
+    url = (
+        f"https://api.github.com/repos/{depot}/actions/workflows/"
+        f"{WORKFLOW_SCRAPER}/runs?per_page={NB_RUNS_CI_MAX}"
+    )
+    requete = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            # Obligatoire côté API GitHub, sinon rejet direct de la requête.
+            "User-Agent": "ouaga-foncier-etl-dashboard-export",
+        },
+    )
+    try:
+        with urllib.request.urlopen(requete, timeout=TIMEOUT_API_CI_S) as reponse:
+            payload = json.loads(reponse.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as exc:
+        logger.warning("Échec de la récupération du statut CI (non bloquant) : %s", exc)
+        return []
+
+    runs_ci = []
+    for run in payload.get("workflow_runs", []):
+        runs_ci.append(
+            {
+                "id": run.get("id"),
+                "statut": run.get("status"),  # queued / in_progress / completed
+                "conclusion": run.get("conclusion"),  # success / failure / cancelled / ...
+                "horodatage": run.get("created_at"),
+                "url": run.get("html_url"),
+                "declencheur": run.get("event"),  # schedule / workflow_dispatch / ...
+            }
+        )
+    return runs_ci
 
 
 def _serialiser(valeur: Any) -> Any:
@@ -110,12 +180,16 @@ def exporter(chemin_sortie: Path = CHEMIN_SORTIE_DEFAUT) -> None:
             for ligne in cur.fetchall()
         ]
 
+    logger.info("Récupération du statut CI des runs (API GitHub Actions)...")
+    runs_ci = _recuperer_runs_ci()
+
     donnees = {
         "exporte_le": datetime.now().astimezone().isoformat(),
         "nb_annonces": len(annonces),
         "nb_runs": len(runs),
         "annonces": annonces,
         "runs": runs,
+        "runs_ci": runs_ci,
     }
 
     chemin_sortie.parent.mkdir(parents=True, exist_ok=True)
@@ -123,9 +197,10 @@ def exporter(chemin_sortie: Path = CHEMIN_SORTIE_DEFAUT) -> None:
         json.dump(donnees, f, ensure_ascii=False, separators=(",", ":"))
 
     logger.info(
-        "Export terminé : %d annonce(s), %d run(s) -> %s (%.1f Ko)",
+        "Export terminé : %d annonce(s), %d run(s), %d run(s) CI -> %s (%.1f Ko)",
         len(annonces),
         len(runs),
+        len(runs_ci),
         chemin_sortie,
         chemin_sortie.stat().st_size / 1024,
     )

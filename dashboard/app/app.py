@@ -33,16 +33,22 @@ px.defaults.template = "plotly_white"
 px.defaults.color_discrete_sequence = PALETTE
 
 
-def _charger_donnees() -> tuple[pd.DataFrame, pd.DataFrame, str]:
-    """Lit le JSON exporté et retourne (annonces, runs, horodatage_export).
+def _charger_donnees() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
+    """Lit le JSON exporté et retourne (annonces, runs, runs_ci, horodatage_export).
 
     Si le fichier est absent (premier déploiement avant le premier export
     réussi), retourne des DataFrames vides plutôt que de faire planter toute
     l'application - un dashboard qui affiche "aucune donnée" est plus utile
     qu'une page blanche.
+
+    `runs_ci` (statut CI des runs via l'API GitHub Actions, ajouté par
+    export_data.py le 2026-08-07) est absent des exports antérieurs à ce
+    changement - `brut.get("runs_ci", [])` retourne alors une liste vide,
+    pas une erreur : l'alerte d'échec ne s'affiche simplement pas tant que
+    le dashboard n'a pas été régénéré avec la nouvelle version du script.
     """
     if not CHEMIN_DONNEES.exists():
-        return pd.DataFrame(), pd.DataFrame(), "jamais"
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), "jamais"
 
     with CHEMIN_DONNEES.open(encoding="utf-8") as f:
         brut = json.load(f)
@@ -57,7 +63,11 @@ def _charger_donnees() -> tuple[pd.DataFrame, pd.DataFrame, str]:
     if not runs.empty:
         runs["horodatage"] = pd.to_datetime(runs["horodatage"], errors="coerce", utc=True)
 
-    return annonces, runs, brut.get("exporte_le", "inconnu")
+    runs_ci = pd.DataFrame(brut.get("runs_ci", []))
+    if not runs_ci.empty:
+        runs_ci["horodatage"] = pd.to_datetime(runs_ci["horodatage"], errors="coerce", utc=True)
+
+    return annonces, runs, runs_ci, brut.get("exporte_le", "inconnu")
 
 
 def _tronquer(texte: object, longueur: int = LONGUEUR_LABEL_MAX) -> object:
@@ -124,12 +134,19 @@ def _widget(fig: go.Figure) -> go.FigureWidget:
     return widget
 
 
-ANNONCES, RUNS, EXPORTE_LE = _charger_donnees()
+ANNONCES, RUNS, RUNS_CI, EXPORTE_LE = _charger_donnees()
 
 GROUPES = sorted(ANNONCES["groupe_nom"].dropna().unique()) if not ANNONCES.empty else []
 DATE_MIN = ANNONCES["date_publication"].min().date() if not ANNONCES.empty else date.today()
 DATE_MAX = ANNONCES["date_publication"].max().date() if not ANNONCES.empty else date.today()
 PRIX_MAX = int(ANNONCES["prix_fcfa"].max()) if not ANNONCES.empty and ANNONCES["prix_fcfa"].notna().any() else 0
+
+# Bornes pour le filtre de plage du graphique journalier de collecte
+# (panneau "Historique des runs") - basées sur la date d'EXÉCUTION du run
+# (horodatage), pas la date de publication des annonces : l'objet de ce
+# graphique est de suivre la collecte elle-même, pas le contenu collecté.
+DATE_MIN_RUNS = RUNS["horodatage"].min().date() if not RUNS.empty else date.today()
+DATE_MAX_RUNS = RUNS["horodatage"].max().date() if not RUNS.empty else date.today()
 
 
 # --------------------------------------------------------------------------- #
@@ -197,6 +214,17 @@ panneau_vue_ensemble = ui.nav_panel(
 panneau_runs = ui.nav_panel(
     "Historique des runs",
     ui.card(
+        ui.card_header("Collecte quotidienne (annonces valides par jour)"),
+        ui.input_date_range(
+            "periode_collecte",
+            "Plage de dates",
+            start=DATE_MIN_RUNS,
+            end=DATE_MAX_RUNS,
+        ),
+        ui.output_ui("alerte_run_echoue"),
+        output_widget("graphe_collecte_journaliere"),
+    ),
+    ui.card(
         ui.card_header("Annonces valides par run (daily vs backfill)"),
         output_widget("graphe_runs"),
     ),
@@ -208,18 +236,6 @@ panneau_runs = ui.nav_panel(
 
 panneau_donnees = ui.nav_panel(
     "Données",
-    ui.layout_columns(
-        ui.card(ui.card_header("Répartition par type de bien"), output_widget("graphe_type_bien")),
-        ui.card(
-            ui.card_header("Distribution des prix"),
-            output_widget("graphe_prix"),
-            ui.p(
-                ui.output_text("graphe_prix_note"),
-                class_="text-muted small mb-0 mt-1",
-            ),
-        ),
-        col_widths=[6, 6],
-    ),
     ui.card(ui.card_header("Annonces filtrées"), ui.output_data_frame("table_annonces")),
 )
 
@@ -268,6 +284,27 @@ def server(input, output, session):  # noqa: A002 - noms imposés par l'API Shin
         modes = input.modes_runs() or []
         return RUNS[RUNS["mode"].isin(modes)]
 
+    @reactive.calc
+    def collecte_journaliere() -> pd.DataFrame:
+        """Agrège les runs par jour (date d'exécution) pour le graphique de
+        suivi de collecte - contrairement à `runs_filtres`, ceci peut
+        fusionner plusieurs runs du même jour (ex. daily + un backfill
+        ponctuel) en une seule barre, ce qui est le but : suivre le volume
+        collecté par jour, pas run par run.
+        """
+        if RUNS.empty:
+            return pd.DataFrame(columns=["jour", "nb_valides"])
+        modes = input.modes_runs() or []
+        debut, fin = input.periode_collecte()
+        df = RUNS[RUNS["mode"].isin(modes)].copy()
+        df = df[
+            (df["horodatage"].dt.date >= debut) & (df["horodatage"].dt.date <= fin)
+        ]
+        if df.empty:
+            return pd.DataFrame(columns=["jour", "nb_valides"])
+        df["jour"] = df["horodatage"].dt.date
+        return df.groupby("jour", as_index=False)["nb_valides"].sum()
+
     # --- KPIs ---------------------------------------------------------- #
 
     @render.text
@@ -313,7 +350,43 @@ def server(input, output, session):  # noqa: A002 - noms imposés par l'API Shin
         theme = "bg-danger" if nb_valides == 0 else None
         return ui.value_box("Dernier run", contenu, theme=theme)
 
+    @render.ui
+    def alerte_run_echoue():
+        """Bandeau d'alerte si le run le plus récent du workflow de scraping
+        a échoué - seule source fiable de ce signal : la base de données
+        n'enregistre RIEN sur les chemins d'échec du pipeline (voir main.py,
+        chaque exception retourne avant enregistrer_run()). Sans donnée
+        `runs_ci` (export généré avant l'ajout de cette fonctionnalité, ou
+        GITHUB_TOKEN absent au moment de l'export), n'affiche RIEN plutôt que
+        de deviner un statut - conformément à la consigne de ne jamais
+        inventer une information.
+        """
+        if RUNS_CI.empty:
+            return None
+        dernier = RUNS_CI.sort_values("horodatage").iloc[-1]
+        if dernier.get("conclusion") != "failure":
+            return None
+        return ui.div(
+            f"Le dernier run du pipeline de scraping a échoué "
+            f"({_formater_horodatage(str(dernier['horodatage']))}).",
+            ui.a("Voir le run sur GitHub", href=dernier.get("url"), target="_blank"),
+            class_="alert alert-danger mb-3",
+        )
+
     # --- Graphiques ------------------------------------------------------ #
+
+    @render_widget
+    def graphe_collecte_journaliere():
+        df = collecte_journaliere()
+        if df.empty:
+            return _widget(px.bar(title="Aucun run sur cette plage"))
+        fig = px.bar(
+            df,
+            x="jour",
+            y="nb_valides",
+            labels={"jour": "Jour", "nb_valides": "Annonces valides collectées"},
+        )
+        return _widget(fig)
 
     @render_widget
     def graphe_par_groupe():
@@ -384,48 +457,13 @@ def server(input, output, session):  # noqa: A002 - noms imposés par l'API Shin
         fig = px.line(long, x="horodatage", y="taux", color="etape", markers=True)
         return _widget(fig)
 
-    @render_widget
-    def graphe_type_bien():
-        df = annonces_filtrees()
-        if df.empty or df["type_bien"].dropna().empty:
-            return _widget(px.pie(title="Aucune donnée"))
-        compte = df["type_bien"].value_counts().reset_index()
-        compte.columns = ["type_bien", "nb"]
-        fig = px.pie(compte, names="type_bien", values="nb")
-        return _widget(fig)
-
-    # --- Distribution des prix : un ou quelques biens à prix extrême ------ #
-    # écrasaient tout le reste de l'histogramme contre l'axe des zéros.
-    # L'affichage exclut désormais le 3% le plus cher (percentile 97), avec
-    # le nombre exact d'exclusions rappelé sous le graphique - les données
-    # ne sont pas perdues, elles restent visibles dans le tableau plus bas.
-
-    def _borne_prix_affichage(df: pd.DataFrame) -> float:
-        return df["prix_fcfa"].quantile(0.97)
-
-    @render_widget
-    def graphe_prix():
-        df = annonces_filtrees().dropna(subset=["prix_fcfa"])
-        if df.empty:
-            return _widget(px.histogram(title="Aucune donnée de prix"))
-        borne = _borne_prix_affichage(df)
-        df_affiche = df[df["prix_fcfa"] <= borne]
-        fig = px.histogram(df_affiche, x="prix_fcfa", nbins=30, labels={"prix_fcfa": "Prix (FCFA)"})
-        return _widget(fig)
-
-    @render.text
-    def graphe_prix_note():
-        df = annonces_filtrees().dropna(subset=["prix_fcfa"])
-        if df.empty:
-            return ""
-        borne = _borne_prix_affichage(df)
-        nb_exclus = int((df["prix_fcfa"] > borne).sum())
-        if nb_exclus == 0:
-            return ""
-        return (
-            f"{nb_exclus} annonce(s) à prix extrême exclue(s) de l'affichage "
-            "(au-delà du 97e centile) - toujours visibles dans le tableau ci-dessous."
-        )
+    # NOTE (2026-08-07) : les graphiques "Répartition par type de bien" et
+    # "Distribution des prix" ont été retirés à la demande explicite de
+    # l'utilisateur - l'objet de ce dashboard est de suivre la COLLECTE
+    # (volume, échecs), pas d'analyser le marché immobilier. Le filtre de
+    # prix (barre latérale) et la colonne prix_fcfa de la table restent
+    # disponibles : ce n'est pas une suppression de donnée, seulement le
+    # retrait des graphiques de statistiques dédiés.
 
     # --- Table ------------------------------------------------------------ #
 
