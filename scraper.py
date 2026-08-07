@@ -778,6 +778,64 @@ def sauvegarder_seen_ids(seen: dict[str, str], retention_jours: int = 90) -> Non
         json.dump(purge, f, ensure_ascii=False, indent=2)
 
 
+def charger_rotation_backfill() -> str | None:
+    """Retourne l'id du dernier groupe/page tenté en mode backfill, ou None
+    si aucun historique (premier backfill, ou fichier absent/corrompu).
+    """
+    if not config.ROTATION_BACKFILL_PATH.exists():
+        return None
+    try:
+        with config.ROTATION_BACKFILL_PATH.open(encoding="utf-8") as f:
+            contenu = json.load(f)
+        return contenu.get("dernier_groupe_id")
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "État de rotation backfill illisible (%s) - repart du début de la liste.",
+            exc,
+        )
+        return None
+
+
+def sauvegarder_rotation_backfill(dernier_groupe_id: str) -> None:
+    config.STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with config.ROTATION_BACKFILL_PATH.open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "dernier_groupe_id": dernier_groupe_id,
+                "mis_a_jour": datetime.now(timezone.utc).isoformat(),
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
+def appliquer_rotation_backfill(
+    groupes: list["config.Groupe"], dernier_id: str | None
+) -> list["config.Groupe"]:
+    """Réordonne la liste de groupes pour qu'un run backfill démarre juste
+    après le dernier groupe tenté au run précédent (round-robin), au lieu de
+    toujours repartir du groupe en tête de groups.csv.
+
+    Si `dernier_id` est absent (premier backfill) ou ne correspond plus à
+    aucun groupe actif (groupe désactivé/retiré entre-temps), retourne la
+    liste inchangée - démarrer du début est le repli le plus sûr, pas un bug.
+    """
+    if dernier_id is None:
+        return groupes
+    ids = [g.id for g in groupes]
+    try:
+        position = ids.index(dernier_id)
+    except ValueError:
+        logger.warning(
+            "Dernier groupe backfill (%s) introuvable dans la liste active - "
+            "rotation ignorée, on repart du début.",
+            dernier_id,
+        )
+        return groupes
+    return groupes[position + 1 :] + groupes[: position + 1]
+
+
 def verifier_cooldown() -> datetime | None:
     """Retourne la date de fin de cooldown si un cooldown est encore actif, sinon None.
 
@@ -1239,7 +1297,19 @@ async def executer_scraping(
         raise ValueError(f"Variable d'environnement {config.ENV_FB_COOKIES} absente.")
     cookies = charger_cookies(cookies_json)
 
-    groupes = config.charger_groupes(limite=group_limit)
+    # En mode backfill, la rotation s'applique AVANT group_limit : on
+    # réordonne la liste complète des groupes actifs pour démarrer juste
+    # après le dernier tenté au run précédent, puis seulement group_limit
+    # tronque à N groupes sur cette liste réordonnée (sinon group_limit
+    # retomberait toujours sur les mêmes premiers groupes de groups.csv,
+    # rotation ou pas).
+    if mode == "backfill":
+        groupes_actifs = config.charger_groupes(limite=None)
+        dernier_id_backfill = charger_rotation_backfill()
+        groupes_actifs = appliquer_rotation_backfill(groupes_actifs, dernier_id_backfill)
+        groupes = groupes_actifs[:group_limit] if group_limit else groupes_actifs
+    else:
+        groupes = config.charger_groupes(limite=group_limit)
 
     etat_sante = charger_sante()
     ajustements = calculer_ajustements(etat_sante)
@@ -1273,6 +1343,12 @@ async def executer_scraping(
     anomalies = 0
     bloque = False
     session_expiree = False
+    # Dernier groupe/page RÉELLEMENT tenté ce run (mode backfill uniquement) -
+    # mis à jour avant même d'appeler scraper_groupe, pour que la rotation
+    # avance même si ce groupe échoue (voir appliquer_rotation_backfill) :
+    # mieux vaut sauter un groupe qui échoue systématiquement que de rester
+    # bloqué dessus indéfiniment d'un run à l'autre.
+    dernier_groupe_id_tente: str | None = None
 
     async with async_playwright() as playwright:
         navigateur, contexte = await creer_navigateur(playwright, cookies)
@@ -1304,6 +1380,7 @@ async def executer_scraping(
                         budget_depasse = True
                         break
 
+                    dernier_groupe_id_tente = groupe.id
                     try:
                         posts = await scraper_groupe(
                             contexte,
@@ -1384,6 +1461,12 @@ async def executer_scraping(
             await sauvegarder_storage_state(contexte)
             await contexte.close()
             await navigateur.close()
+            if mode == "backfill" and dernier_groupe_id_tente is not None:
+                sauvegarder_rotation_backfill(dernier_groupe_id_tente)
+                logger.info(
+                    "Rotation backfill mise à jour : prochain run reprendra après %s.",
+                    dernier_groupe_id_tente,
+                )
             nouvel_etat_sante = mettre_a_jour_apres_run(
                 etat_sante,
                 anomalies=anomalies,

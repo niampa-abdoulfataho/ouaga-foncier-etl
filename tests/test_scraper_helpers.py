@@ -496,6 +496,51 @@ class TestSeenIds:
         assert scraper.charger_seen_ids() == {}
 
 
+class TestRotationBackfill:
+    """Mécanisme de reprise entre runs backfill (2026-08-07, voir config.py -
+    ROTATION_BACKFILL_PATH) : sans lui, group_limit retombait toujours sur
+    les mêmes premiers groupes de groups.csv d'un run manuel à l'autre.
+    """
+
+    def _groupe(self, id_: str) -> config.Groupe:
+        return config.Groupe(id=id_, nom=f"Groupe {id_}", url=f"https://x/{id_}/")
+
+    def test_charger_sans_fichier_retourne_none(self, repertoires_isoles):
+        assert scraper.charger_rotation_backfill() is None
+
+    def test_sauvegarder_puis_charger_roundtrip(self, repertoires_isoles):
+        scraper.sauvegarder_rotation_backfill("42")
+        assert scraper.charger_rotation_backfill() == "42"
+
+    def test_fichier_corrompu_retourne_none_sans_planter(self, repertoires_isoles):
+        config.ROTATION_BACKFILL_PATH.write_text("{pas du json", encoding="utf-8")
+        assert scraper.charger_rotation_backfill() is None
+
+    def test_rotation_demarre_apres_le_dernier_traite(self):
+        groupes = [self._groupe(str(i)) for i in range(1, 6)]  # 1..5
+        resultat = scraper.appliquer_rotation_backfill(groupes, dernier_id="2")
+        assert [g.id for g in resultat] == ["3", "4", "5", "1", "2"]
+
+    def test_rotation_reboucle_sur_le_dernier_groupe_de_la_liste(self):
+        # Le run précédent s'est arrêté sur le tout dernier groupe -> on
+        # reboucle intégralement sur la liste (round-robin complet).
+        groupes = [self._groupe(str(i)) for i in range(1, 4)]  # 1..3
+        resultat = scraper.appliquer_rotation_backfill(groupes, dernier_id="3")
+        assert [g.id for g in resultat] == ["1", "2", "3"]
+
+    def test_rotation_sans_dernier_id_retourne_liste_inchangee(self):
+        groupes = [self._groupe(str(i)) for i in range(1, 4)]
+        resultat = scraper.appliquer_rotation_backfill(groupes, dernier_id=None)
+        assert resultat == groupes
+
+    def test_rotation_id_absent_de_la_liste_retourne_liste_inchangee(self):
+        # Groupe désactivé/retiré de groups.csv entre deux runs - repli sûr :
+        # on ne plante pas, on repart du début plutôt que de deviner.
+        groupes = [self._groupe(str(i)) for i in range(1, 4)]
+        resultat = scraper.appliquer_rotation_backfill(groupes, dernier_id="999")
+        assert resultat == groupes
+
+
 class TestParserHorodatageRelatif:
     """Le parseur d'horodatage mbasic est une fonction pure - contrairement à
     l'ancienne extraction (jamais implémentée faute d'accès DOM live), elle

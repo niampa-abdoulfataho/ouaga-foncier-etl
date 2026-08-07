@@ -36,6 +36,7 @@ def repertoires_isoles(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "SEEN_IDS_PATH", state / "seen_post_ids.json")
     monkeypatch.setattr(config, "COOLDOWN_PATH", state / "cooldown_until.json")
     monkeypatch.setattr(config, "SANTE_PATH", state / "sante_scraper.json")
+    monkeypatch.setattr(config, "ROTATION_BACKFILL_PATH", state / "rotation_backfill.json")
     monkeypatch.setattr(config, "STORAGE_STATE_PATH", state / "storage_state.json")
     monkeypatch.setattr(config, "MASTER_XLSX_PATH", processed / "annonces.xlsx")
 

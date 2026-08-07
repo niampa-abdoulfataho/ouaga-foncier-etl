@@ -34,6 +34,16 @@ COOLDOWN_PATH = STATE_DIR / "cooldown_until.json"
 STORAGE_STATE_PATH = STATE_DIR / "storage_state.json"
 SANTE_PATH = STATE_DIR / "sante_scraper.json"
 
+# Rotation du mode "backfill" (2026-08-07) : mémorise le dernier groupe/page
+# effectivement tenté, pour que le run backfill suivant reprenne juste après
+# lui plutôt que de repartir systématiquement du haut de groups.csv. Sans ce
+# fichier, group_limit prenant toujours les N premiers groupes dans l'ordre
+# du CSV, une série de runs manuels ne dépasserait jamais les tout premiers
+# groupes (25 cibles / ~3 groupes couverts par run de 45 min en backfill).
+# Fichier séparé de sante_scraper.json : concepts indépendants (rotation =
+# position dans la liste, santé = confiance/throttle adaptatif).
+ROTATION_BACKFILL_PATH = STATE_DIR / "rotation_backfill.json"
+
 # Vue Excel régénérée à chaque run à partir de la base maître PostgreSQL - UN
 # SEUL fichier, toujours à jour, plutôt qu'un CSV différent par run (voir
 # processor.py). La base maître elle-même n'est plus un fichier local depuis
