@@ -123,7 +123,10 @@ def _formater_horodatage(valeur: str) -> str:
     return dt.strftime("%d/%m/%Y %H:%M UTC")
 
 
-def _widget(fig: go.Figure) -> go.FigureWidget:
+HAUTEUR_GRAPHIQUE_PX = 380
+
+
+def _widget(fig: go.Figure, hauteur: int = HAUTEUR_GRAPHIQUE_PX) -> go.FigureWidget:
     """Enveloppe une figure Plotly Express en FigureWidget, barre d'outils masquée.
 
     La barre d'outils Plotly (zoom/pan/export PNG) n'apporte rien sur un
@@ -135,7 +138,18 @@ def _widget(fig: go.Figure) -> go.FigureWidget:
     production peut différer de celle testée ici. D'où le try/except : si
     l'attribut est ignoré par une autre version, la seule conséquence est
     que la barre d'outils reste visible, pas un plantage du dashboard.
+
+    Hauteur fixée en pixels (BUG CORRIGÉ, retour utilisateur du 2026-08-10) :
+    sans ça, les graphiques s'affichaient comme un simple trait quasi invisible
+    tant que la carte n'était pas passée en plein écran. Cause : `card(...,
+    full_screen=True)` ne donne pas de hauteur définie au widget en mode normal
+    - Plotly autosize alors sur un conteneur flex de hauteur ~0, et ne se
+    recalcule correctement qu'au redimensionnement déclenché par le plein
+    écran. Fixer une hauteur explicite sur la figure ET sur la carte (voir
+    ui.card(height=...) dans les définitions ci-dessous) règle le problème
+    dans les deux modes.
     """
+    fig.update_layout(height=hauteur, margin=dict(l=10, r=10, t=30, b=10))
     widget = go.FigureWidget(fig.data, fig.layout)
     try:
         widget._config = {"displayModeBar": False}
@@ -150,21 +164,48 @@ GROUPES = sorted(ANNONCES["groupe_nom"].dropna().unique()) if not ANNONCES.empty
 DATE_MIN = ANNONCES["date_publication"].min().date() if not ANNONCES.empty else date.today()
 DATE_MAX = ANNONCES["date_publication"].max().date() if not ANNONCES.empty else date.today()
 
-# Bornes pour le filtre de plage du graphique "Collecte quotidienne" - basées
-# sur premiere_collecte (date/heure réelle d'enregistrement en base), pas
-# date_publication (voir commentaire dans _charger_donnees).
-_PREMIERE_COLLECTE_VALIDES = (
-    ANNONCES["premiere_collecte"].dropna() if not ANNONCES.empty else pd.Series(dtype="datetime64[ns, UTC]")
-)
-DATE_MIN_COLLECTE = _PREMIERE_COLLECTE_VALIDES.min().date() if not _PREMIERE_COLLECTE_VALIDES.empty else date.today()
-DATE_MAX_COLLECTE = _PREMIERE_COLLECTE_VALIDES.max().date() if not _PREMIERE_COLLECTE_VALIDES.empty else date.today()
-
 # Bornes pour les filtres de plage des histogrammes daily/backfill (panneau
 # "Historique des runs") - basées sur la date d'EXÉCUTION du run
 # (horodatage) : seule la table `runs` porte l'information de mode
-# (daily/backfill), absente de la table `annonces`.
-DATE_MIN_RUNS = RUNS["horodatage"].min().date() if not RUNS.empty else date.today()
+# (daily/backfill), absente de la table `annonces`. Calculé AVANT les bornes
+# de premiere_collecte ci-dessous, qui s'en servent comme plancher de
+# cohérence.
+PREMIER_RUN_HORODATAGE = RUNS["horodatage"].min() if not RUNS.empty else None
+DATE_MIN_RUNS = PREMIER_RUN_HORODATAGE.date() if PREMIER_RUN_HORODATAGE is not None else date.today()
 DATE_MAX_RUNS = RUNS["horodatage"].max().date() if not RUNS.empty else date.today()
+
+# Bornes pour le filtre de plage du graphique "Collecte quotidienne" - basées
+# sur premiere_collecte (date/heure réelle d'enregistrement en base), pas
+# date_publication (voir commentaire dans _charger_donnees).
+#
+# GARDE-FOU (2026-08-10) : une annonce ne peut logiquement pas avoir été
+# enregistrée en base AVANT le tout premier run du pipeline - si c'est le cas
+# dans les données exportées, c'est une anomalie (ligne de test insérée
+# manuellement lors du développement initial, ou bug de colonne ailleurs dans
+# le pipeline), pas une vraie collecte. Sans ce garde-fou, une telle ligne
+# fausse la borne basse du filtre de date (observé en conditions réelles :
+# borne affichée à 2023 alors que le projet n'existait pas encore). On
+# n'écarte PAS ces lignes des graphiques eux-mêmes (pas de perte de donnée),
+# on se contente de ne pas les laisser fausser la borne du sélecteur de date.
+_PREMIERE_COLLECTE_VALIDES = (
+    ANNONCES["premiere_collecte"].dropna() if not ANNONCES.empty else pd.Series(dtype="datetime64[ns, UTC]")
+)
+_MIN_PREMIERE_COLLECTE_BRUT = (
+    _PREMIERE_COLLECTE_VALIDES.min() if not _PREMIERE_COLLECTE_VALIDES.empty else None
+)
+NB_ANOMALIES_PREMIERE_COLLECTE = 0
+if _MIN_PREMIERE_COLLECTE_BRUT is not None and PREMIER_RUN_HORODATAGE is not None:
+    NB_ANOMALIES_PREMIERE_COLLECTE = int(
+        (_PREMIERE_COLLECTE_VALIDES < PREMIER_RUN_HORODATAGE).sum()
+    )
+
+if NB_ANOMALIES_PREMIERE_COLLECTE > 0:
+    DATE_MIN_COLLECTE = PREMIER_RUN_HORODATAGE.date()
+elif _MIN_PREMIERE_COLLECTE_BRUT is not None:
+    DATE_MIN_COLLECTE = _MIN_PREMIERE_COLLECTE_BRUT.date()
+else:
+    DATE_MIN_COLLECTE = date.today()
+DATE_MAX_COLLECTE = _PREMIERE_COLLECTE_VALIDES.max().date() if not _PREMIERE_COLLECTE_VALIDES.empty else date.today()
 
 
 # --------------------------------------------------------------------------- #
@@ -214,6 +255,7 @@ panneau_vue_ensemble = ui.nav_panel(
         ui.card_header("Annonces par groupe"),
         output_widget("graphe_par_groupe"),
         full_screen=True,
+        height="480px",
     ),
 )
 
@@ -228,11 +270,19 @@ panneau_runs = ui.nav_panel(
             start=DATE_MIN_COLLECTE,
             end=DATE_MAX_COLLECTE,
         ),
+        ui.output_text("note_anomalie_collecte_db"),
         output_widget("graphe_collecte_db"),
         full_screen=True,
+        height="540px",
     ),
+    # "quotidien"/"rattrapage" plutôt que "daily"/"backfill" (BUG CORRIGÉ,
+    # 2026-08-10) : ces mots anglais isolés dans une interface francophone
+    # étaient traduits de façon incohérente par la traduction automatique du
+    # navigateur ("backfill" -> "remplissage"), rendant les intitulés absurdes.
+    # "rattrapage" reprend le vocabulaire déjà utilisé ailleurs dans le projet
+    # (README.md, main.py --mode) pour désigner le mode backfill.
     ui.card(
-        ui.card_header("Collecte - mode daily"),
+        ui.card_header("Collecte - mode quotidien"),
         ui.input_date_range(
             "periode_daily",
             "Plage de dates",
@@ -241,9 +291,10 @@ panneau_runs = ui.nav_panel(
         ),
         output_widget("graphe_collecte_daily"),
         full_screen=True,
+        height="540px",
     ),
     ui.card(
-        ui.card_header("Collecte - mode backfill"),
+        ui.card_header("Collecte - mode rattrapage (backfill)"),
         ui.input_date_range(
             "periode_backfill",
             "Plage de dates",
@@ -252,6 +303,7 @@ panneau_runs = ui.nav_panel(
         ),
         output_widget("graphe_collecte_backfill"),
         full_screen=True,
+        height="540px",
     ),
 )
 
@@ -414,6 +466,17 @@ def server(input, output, session):  # noqa: A002 - noms imposés par l'API Shin
             f"({_formater_horodatage(str(dernier['horodatage']))}).",
             ui.a("Voir le run sur GitHub", href=dernier.get("url"), target="_blank"),
             class_="alert alert-danger mb-3",
+        )
+
+    @render.text
+    def note_anomalie_collecte_db():
+        if NB_ANOMALIES_PREMIERE_COLLECTE == 0:
+            return ""
+        return (
+            f"{NB_ANOMALIES_PREMIERE_COLLECTE} annonce(s) avec une date de collecte "
+            "antérieure au premier run enregistré - exclue(s) du calcul de la borne "
+            "du filtre (anomalie de données à vérifier), mais toujours visibles dans "
+            "les graphiques et la table."
         )
 
     # --- Graphiques ------------------------------------------------------ #
