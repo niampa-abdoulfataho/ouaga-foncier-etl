@@ -253,9 +253,8 @@ panneau_vue_ensemble = ui.nav_panel(
     ),
     ui.card(
         ui.card_header("Annonces par groupe"),
-        output_widget("graphe_par_groupe"),
+        ui.div(output_widget("graphe_par_groupe"), style=f"height: {HAUTEUR_GRAPHIQUE_PX}px;"),
         full_screen=True,
-        height="480px",
     ),
 )
 
@@ -271,9 +270,8 @@ panneau_runs = ui.nav_panel(
             end=DATE_MAX_COLLECTE,
         ),
         ui.output_text("note_anomalie_collecte_db"),
-        output_widget("graphe_collecte_db"),
+        ui.div(output_widget("graphe_collecte_db"), style=f"height: {HAUTEUR_GRAPHIQUE_PX}px;"),
         full_screen=True,
-        height="540px",
     ),
     # "quotidien"/"rattrapage" plutôt que "daily"/"backfill" (BUG CORRIGÉ,
     # 2026-08-10) : ces mots anglais isolés dans une interface francophone
@@ -289,9 +287,8 @@ panneau_runs = ui.nav_panel(
             start=DATE_MIN_RUNS,
             end=DATE_MAX_RUNS,
         ),
-        output_widget("graphe_collecte_daily"),
+        ui.div(output_widget("graphe_collecte_daily"), style=f"height: {HAUTEUR_GRAPHIQUE_PX}px;"),
         full_screen=True,
-        height="540px",
     ),
     ui.card(
         ui.card_header("Collecte - mode rattrapage (backfill)"),
@@ -301,9 +298,8 @@ panneau_runs = ui.nav_panel(
             start=DATE_MIN_RUNS,
             end=DATE_MAX_RUNS,
         ),
-        output_widget("graphe_collecte_backfill"),
+        ui.div(output_widget("graphe_collecte_backfill"), style=f"height: {HAUTEUR_GRAPHIQUE_PX}px;"),
         full_screen=True,
-        height="540px",
     ),
 )
 
