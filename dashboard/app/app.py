@@ -253,7 +253,7 @@ panneau_vue_ensemble = ui.nav_panel(
     ),
     ui.card(
         ui.card_header("Annonces par groupe"),
-        ui.div(output_widget("graphe_par_groupe"), style=f"height: {HAUTEUR_GRAPHIQUE_PX}px;"),
+        output_widget("graphe_par_groupe", height=f"{HAUTEUR_GRAPHIQUE_PX}px"),
         full_screen=True,
     ),
 )
@@ -270,7 +270,7 @@ panneau_runs = ui.nav_panel(
             end=DATE_MAX_COLLECTE,
         ),
         ui.output_text("note_anomalie_collecte_db"),
-        ui.div(output_widget("graphe_collecte_db"), style=f"height: {HAUTEUR_GRAPHIQUE_PX}px;"),
+        output_widget("graphe_collecte_db", height=f"{HAUTEUR_GRAPHIQUE_PX}px"),
         full_screen=True,
     ),
     # "quotidien"/"rattrapage" plutôt que "daily"/"backfill" (BUG CORRIGÉ,
@@ -287,7 +287,7 @@ panneau_runs = ui.nav_panel(
             start=DATE_MIN_RUNS,
             end=DATE_MAX_RUNS,
         ),
-        ui.div(output_widget("graphe_collecte_daily"), style=f"height: {HAUTEUR_GRAPHIQUE_PX}px;"),
+        output_widget("graphe_collecte_daily", height=f"{HAUTEUR_GRAPHIQUE_PX}px"),
         full_screen=True,
     ),
     ui.card(
@@ -298,7 +298,7 @@ panneau_runs = ui.nav_panel(
             start=DATE_MIN_RUNS,
             end=DATE_MAX_RUNS,
         ),
-        ui.div(output_widget("graphe_collecte_backfill"), style=f"height: {HAUTEUR_GRAPHIQUE_PX}px;"),
+        output_widget("graphe_collecte_backfill", height=f"{HAUTEUR_GRAPHIQUE_PX}px"),
         full_screen=True,
     ),
 )
