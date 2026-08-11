@@ -437,20 +437,35 @@ MAX_PAGES_SANS_NOUVEAU_POST = 4  # arrêt du scroll si N étapes consécutives s
 MAX_PAGES_ABSOLU = 60  # garde-fou dur pour éviter un scroll infini (mode "daily")
 
 # Plafond dédié au mode "backfill", plus permissif que MAX_PAGES_ABSOLU.
-# Chiffre choisi le 2026-08-05 après un run réel (group_limit=0, days_back=7) :
-# 11 groupes actifs sur 13 ont buté sur MAX_PAGES_ABSOLU=60 AVANT même
-# d'atteindre la fenêtre de 7 jours (~3,7s/étape observés, donc 60 étapes
-# ~3,7 min/groupe) - donc pour un backfill de 90 jours, 60 est
-# structurellement insuffisant sur les groupes actifs, indépendamment de
-# `days_back`. 250 (~4x) donne une profondeur nettement plus grande
-# (~15 min/groupe si le plafond est atteint) sans viser un chiffre extrême :
-# aucune donnée réelle ne permet de garantir qu'il suffit à couvrir 90 jours
-# pleins sur les groupes les plus actifs (densité de posts/jour inconnue) -
-# à traiter comme un plafond "best effort", pas une garantie de couverture.
-# Le budget de session (SESSION_DUREE_MAX_MINUTES) reste la limite globale :
-# avec ce plafond, un run couvrira moins de groupes avant de s'arrêter
-# proprement, les groupes restants étant repris au(x) run(s) suivant(s).
-MAX_PAGES_ABSOLU_BACKFILL = 250
+#
+# RÉVISÉ le 2026-08-11 (250 -> 650), après analyse de 16 runs backfill réels
+# (2170 annonces) via des exports du dashboard : avec `group_limit=3`, la
+# plupart des groupes plafonnaient à 250 étapes (~15 min à ~3,5s/étape) SANS
+# avoir atteint 90 jours - certains groupes très actifs (jusqu'à 293k
+# membres, plusieurs centaines de posts/jour) épuisaient les 250 étapes en
+# quelques jours de contenu seulement. Seuls 3 groupes/pages moins denses
+# atteignaient déjà 50-94 jours avec ce plafond, preuve que le plafond - pas
+# `days_back` - était le facteur limitant sur les groupes actifs.
+#
+# 650 est dimensionné pour consommer tout le budget de session en un seul
+# groupe : 650 étapes x ~3,5s/étape ≈ 38 min, sous les 45 min de
+# SESSION_DUREE_MAX_MINUTES avec une marge de sécurité pour l'échauffement et
+# le traitement réseau. CONSÉQUENCE IMPORTANTE : ce dimensionnement suppose
+# `group_limit=1` en backfill désormais (pas 3) - avec 3 groupes, le budget
+# de session serait dépassé (3 x 38 min > 45 min), un 2e ou 3e groupe d'un
+# batch pourrait alors faire déborder la session bien au-delà de 45 min avant
+# de s'arrêter (aucune vérification du budget de session PENDANT le scroll
+# d'un groupe, seulement ENTRE deux groupes - voir executer_scraping). Un
+# seul groupe par run signifie plus de runs nécessaires pour tourner sur les
+# 23 cibles (rotation persistée, voir appliquer_rotation_backfill) - à
+# automatiser via un déclenchement planifié plutôt que des lancements
+# manuels répétés.
+#
+# Toujours un plafond "best effort", pas une garantie de couverture des 90
+# jours sur les groupes les plus denses - aucune donnée réelle ne permet de
+# l'affirmer avec certitude avant d'avoir observé des runs à ce nouveau
+# plafond.
+MAX_PAGES_ABSOLU_BACKFILL = 650
 
 NAVIGATION_TIMEOUT_MS = 30_000
 
