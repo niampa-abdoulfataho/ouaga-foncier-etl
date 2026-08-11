@@ -206,6 +206,57 @@ class TestStructurerLot:
         assert non_valides[0]["motif_rejet"] == "llm_juge_invalide"
 
 
+class TestAnnonceStructureeValidation:
+    """Validateurs Pydantic de AnnonceStructuree - purement Python, pas besoin
+    de DB ni de réseau. Couvre le bug corrigé le 2026-08-11 (voir
+    upsert_annonces) : une valeur de prix/superficie dépassant les bornes
+    INTEGER de Postgres faisait planter tout un batch d'upsert avec
+    `NumericValueOutOfRange`. Le validateur doit désormais neutraliser ces
+    valeurs (mise à null) AVANT qu'elles n'atteignent la base.
+    """
+
+    def _construire(self, **overrides):
+        base = dict(
+            est_une_annonce_valide=True,
+            type_bien="parcelle",
+            superficie_m2=600,
+            prix_fcfa=15_000_000,
+        )
+        base.update(overrides)
+        return processor.AnnonceStructuree(**base)
+
+    def test_valeur_normale_conservee(self):
+        a = self._construire(prix_fcfa=15_000_000, superficie_m2=600)
+        assert a.prix_fcfa == 15_000_000
+        assert a.superficie_m2 == 600
+
+    def test_valeur_negative_mise_a_null(self):
+        a = self._construire(prix_fcfa=-5, superficie_m2=-1)
+        assert a.prix_fcfa is None
+        assert a.superficie_m2 is None
+
+    def test_valeur_depassant_integer_postgres_mise_a_null(self):
+        # processor.POSTGRES_INTEGER_MAX = 2_147_483_647 (INTEGER Postgres,
+        # signé 4 octets) - une valeur au-delà ferait planter l'upsert.
+        trop_grand = processor.POSTGRES_INTEGER_MAX + 1
+        a = self._construire(prix_fcfa=trop_grand, superficie_m2=trop_grand)
+        assert a.prix_fcfa is None
+        assert a.superficie_m2 is None
+
+    def test_valeur_a_la_borne_exacte_conservee(self):
+        # Cas limite : la borne elle-même doit rester une valeur INTEGER
+        # valide côté Postgres, donc conservée (pas de rejet trop agressif).
+        borne = processor.POSTGRES_INTEGER_MAX
+        a = self._construire(prix_fcfa=borne, superficie_m2=borne)
+        assert a.prix_fcfa == borne
+        assert a.superficie_m2 == borne
+
+    def test_valeur_null_conservee(self):
+        a = self._construire(prix_fcfa=None, superficie_m2=None)
+        assert a.prix_fcfa is None
+        assert a.superficie_m2 is None
+
+
 class TestConstruireClient:
     def test_leve_erreur_si_cle_absente(self, monkeypatch):
         monkeypatch.delenv(config.ENV_OPENAI_KEY, raising=False)

@@ -102,6 +102,20 @@ def filtrer_candidats(posts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
 # Étape B : structuration via API OpenAI (async, Structured Outputs, schéma forcé)
 # --------------------------------------------------------------------------- #
 
+# Borne PostgreSQL INTEGER (colonnes superficie_m2/prix_fcfa, voir SCHEMA_SQL)
+# - PAS un seuil "métier" inventé, une contrainte technique réelle : un
+# INTEGER Postgres est signé sur 4 octets, le dépassement fait planter
+# l'upsert avec `psycopg.errors.NumericValueOutOfRange` (observé en
+# conditions réelles le 2026-08-11 sur un run backfill profond - une valeur
+# de prix/superficie mal extraite par le LLM sur un post ancien a fait
+# échouer TOUT le batch d'upsert, y compris les annonces valides qui le
+# précédaient - voir aussi le bug d'atomicité corrigé dans upsert_annonces).
+# Constante au niveau module plutôt qu'attribut de classe : Pydantic v2
+# intercepte tout attribut de classe préfixé par "_" comme un ModelPrivateAttr
+# (confirmé en testant en conditions réelles - `cls._X` renvoie l'objet
+# descripteur, pas la valeur), donc inutilisable tel quel dans un validator.
+POSTGRES_INTEGER_MAX = 2_147_483_647
+
 
 class AnnonceStructuree(BaseModel):
     """Schéma de sortie validé (voir aussi `config.SCHEMA_ANNONCE_JSON_SCHEMA` côté prompt).
@@ -134,6 +148,13 @@ class AnnonceStructuree(BaseModel):
     def _valider_positif(cls, v: int | None) -> int | None:
         if v is not None and v < 0:
             logger.warning("Valeur numérique négative du LLM ignorée (mise à null) : %s", v)
+            return None
+        if v is not None and v > POSTGRES_INTEGER_MAX:
+            logger.warning(
+                "Valeur numérique du LLM hors bornes INTEGER Postgres, ignorée "
+                "(mise à null) : %s",
+                v,
+            )
             return None
         return v
 
@@ -364,59 +385,92 @@ def _connexion(dsn: str) -> psycopg.Connection:
     return conn
 
 
+_UPSERT_SQL = """
+    INSERT INTO annonces (
+        id, groupe_nom, url, date_publication, date_incertaine,
+        type_bien, quartier_zone, superficie_m2, prix_fcfa, statut_document,
+        contacts_whatsapp, mots_cles_pertinents, resume_court, texte_nettoye,
+        premiere_collecte, derniere_maj
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (id) DO UPDATE SET
+        groupe_nom = EXCLUDED.groupe_nom,
+        url = EXCLUDED.url,
+        date_publication = EXCLUDED.date_publication,
+        date_incertaine = EXCLUDED.date_incertaine,
+        type_bien = EXCLUDED.type_bien,
+        quartier_zone = EXCLUDED.quartier_zone,
+        superficie_m2 = EXCLUDED.superficie_m2,
+        prix_fcfa = EXCLUDED.prix_fcfa,
+        statut_document = EXCLUDED.statut_document,
+        contacts_whatsapp = EXCLUDED.contacts_whatsapp,
+        mots_cles_pertinents = EXCLUDED.mots_cles_pertinents,
+        resume_court = EXCLUDED.resume_court,
+        texte_nettoye = EXCLUDED.texte_nettoye,
+        derniere_maj = EXCLUDED.derniere_maj
+    """
+
+
 def upsert_annonces(annonces: list[dict[str, Any]], dsn: str | None = None) -> int:
     """Insère les nouvelles annonces et met à jour celles déjà connues (upsert
     par `id` de post), sans jamais dupliquer de ligne ni perdre la date de
     première collecte d'une annonce déjà vue lors d'un run précédent.
+
+    BUG CORRIGÉ (2026-08-11, observé en conditions réelles sur un run
+    backfill profond) : la version précédente exécutait toutes les insertions
+    dans UNE SEULE transaction, avec un unique commit() à la fin. Une seule
+    ligne en erreur (ex. `NumericValueOutOfRange` sur un prix/superficie
+    aberrant extrait par le LLM) faisait échouer tout le batch - y compris
+    les dizaines/centaines d'annonces valides déjà insérées avant elle dans
+    la boucle, jamais commitées à cause de l'exception. Corrigé en isolant
+    chaque ligne dans sa propre transaction imbriquée (savepoint Postgres via
+    `conn.transaction()` en psycopg3) : une ligne en erreur est journalisée et
+    ignorée, le reste du batch est conservé.
     """
     dsn = dsn or config.DATABASE_URL
     if not annonces:
         return 0
 
     maintenant = datetime.now(timezone.utc)
+    ids_en_echec: list[str] = []
     conn = _connexion(dsn)
     try:
-        with conn.cursor() as cur:
+        with conn.transaction():
             for a in annonces:
-                cur.execute(
-                    """
-                    INSERT INTO annonces (
-                        id, groupe_nom, url, date_publication, date_incertaine,
-                        type_bien, quartier_zone, superficie_m2, prix_fcfa, statut_document,
-                        contacts_whatsapp, mots_cles_pertinents, resume_court, texte_nettoye,
-                        premiere_collecte, derniere_maj
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (id) DO UPDATE SET
-                        groupe_nom = EXCLUDED.groupe_nom,
-                        url = EXCLUDED.url,
-                        date_publication = EXCLUDED.date_publication,
-                        date_incertaine = EXCLUDED.date_incertaine,
-                        type_bien = EXCLUDED.type_bien,
-                        quartier_zone = EXCLUDED.quartier_zone,
-                        superficie_m2 = EXCLUDED.superficie_m2,
-                        prix_fcfa = EXCLUDED.prix_fcfa,
-                        statut_document = EXCLUDED.statut_document,
-                        contacts_whatsapp = EXCLUDED.contacts_whatsapp,
-                        mots_cles_pertinents = EXCLUDED.mots_cles_pertinents,
-                        resume_court = EXCLUDED.resume_court,
-                        texte_nettoye = EXCLUDED.texte_nettoye,
-                        derniere_maj = EXCLUDED.derniere_maj
-                    """,
-                    (
-                        a.get("id"), a.get("groupe_nom"), a.get("url"), a.get("date_publication"),
-                        bool(a.get("date_incertaine")), a.get("type_bien"), a.get("quartier_zone"),
-                        a.get("superficie_m2"), a.get("prix_fcfa"), a.get("statut_document"),
-                        _serialiser_valeur(a.get("contacts_whatsapp")),
-                        _serialiser_valeur(a.get("mots_cles_pertinents")),
-                        a.get("resume_court"), a.get("texte_nettoye"), maintenant, maintenant,
-                    ),
-                )
-        conn.commit()
+                try:
+                    with conn.transaction():  # savepoint imbriqué : isole cette ligne du reste du batch
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                _UPSERT_SQL,
+                                (
+                                    a.get("id"), a.get("groupe_nom"), a.get("url"),
+                                    a.get("date_publication"), bool(a.get("date_incertaine")),
+                                    a.get("type_bien"), a.get("quartier_zone"),
+                                    a.get("superficie_m2"), a.get("prix_fcfa"),
+                                    a.get("statut_document"),
+                                    _serialiser_valeur(a.get("contacts_whatsapp")),
+                                    _serialiser_valeur(a.get("mots_cles_pertinents")),
+                                    a.get("resume_court"), a.get("texte_nettoye"),
+                                    maintenant, maintenant,
+                                ),
+                            )
+                except psycopg.Error as exc:
+                    ids_en_echec.append(str(a.get("id")))
+                    logger.error(
+                        "Échec upsert de l'annonce id=%s (%s) - ignorée, le reste "
+                        "du batch est conservé.",
+                        a.get("id"), exc,
+                    )
     finally:
         conn.close()
 
-    logger.info("%d annonce(s) upsertées dans la base maître", len(annonces))
-    return len(annonces)
+    nb_reussies = len(annonces) - len(ids_en_echec)
+    if ids_en_echec:
+        logger.warning(
+            "%d annonce(s) rejetée(s) lors de l'upsert (voir logs ERROR ci-dessus) : %s",
+            len(ids_en_echec), ids_en_echec,
+        )
+    logger.info("%d annonce(s) upsertées dans la base maître", nb_reussies)
+    return nb_reussies
 
 
 def exporter_xlsx_depuis_db(dsn: str | None = None, chemin_xlsx: Path | None = None) -> Path:
