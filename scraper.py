@@ -1025,6 +1025,7 @@ async def scraper_groupe(
     seen_ids: dict[str, str],
     delai_multiplicateur: float = 1.0,
     max_pages_absolu: int = config.MAX_PAGES_ABSOLU,
+    max_pages_sans_nouveau: int = config.MAX_PAGES_SANS_NOUVEAU_POST,
 ) -> list[dict[str, Any]]:
     """Parcourt un groupe Facebook (web.facebook.com, scroll simulé + capture
     réseau GraphQL) et retourne les nouveaux posts non vus.
@@ -1062,6 +1063,19 @@ async def scraper_groupe(
             (voir `config.MAX_PAGES_ABSOLU` / `MAX_PAGES_ABSOLU_BACKFILL` -
             le mode "backfill" utilise un plafond plus permissif, voir
             `executer_scraping`).
+        max_pages_sans_nouveau: nombre d'étapes consécutives sans post inédit
+            toléré avant arrêt (voir `config.MAX_PAGES_SANS_NOUVEAU_POST` /
+            `MAX_PAGES_SANS_NOUVEAU_POST_BACKFILL`). PROBLÈME IDENTIFIÉ le
+            2026-08-12 sur des runs backfill réels : sur une RE-visite d'un
+            groupe déjà partiellement backfillé, les premières étapes
+            retombent forcément sur du contenu déjà dans `seen_ids` - avec
+            le seuil "daily" (4), l'arrêt anticipé se déclenche presque
+            immédiatement, empêchant TOUTE progression au-delà de la
+            profondeur déjà atteinte lors d'une visite précédente, quel que
+            soit `max_pages_absolu`. Le mode backfill utilise donc un seuil
+            beaucoup plus tolérant (voir `executer_scraping`), pour laisser
+            au scroll une chance de traverser la zone déjà vue et d'atteindre
+            du contenu réellement inédit plus profond.
     """
     date_limite = datetime.now(timezone.utc) - timedelta(days=max_days_back)
     page = await context.new_page()
@@ -1214,11 +1228,13 @@ async def scraper_groupe(
                     )
                     break
 
-            if etapes_sans_nouveau >= config.MAX_PAGES_SANS_NOUVEAU_POST:
+            if etapes_sans_nouveau >= max_pages_sans_nouveau:
                 logger.info(
-                    "Groupe %s : %d étape(s) de scroll sans nouveau post, arrêt.",
+                    "Groupe %s : %d étape(s) de scroll sans nouveau post "
+                    "(seuil=%d), arrêt.",
                     groupe.nom,
                     etapes_sans_nouveau,
+                    max_pages_sans_nouveau,
                 )
                 break
 
@@ -1336,6 +1352,11 @@ async def executer_scraping(
     plafond_scroll = (
         config.MAX_PAGES_ABSOLU_BACKFILL if mode == "backfill" else config.MAX_PAGES_ABSOLU
     )
+    seuil_sans_nouveau = (
+        config.MAX_PAGES_SANS_NOUVEAU_POST_BACKFILL
+        if mode == "backfill"
+        else config.MAX_PAGES_SANS_NOUVEAU_POST
+    )
     seen_ids = charger_seen_ids()
     fichiers_sauvegardes: list[Path] = []
     debut_session = datetime.now(timezone.utc)
@@ -1389,6 +1410,7 @@ async def executer_scraping(
                             seen_ids,
                             delai_multiplicateur=ajustements.delai_multiplicateur,
                             max_pages_absolu=plafond_scroll,
+                            max_pages_sans_nouveau=seuil_sans_nouveau,
                         )
                     except SessionExpireeError as exc:
                         logger.critical(

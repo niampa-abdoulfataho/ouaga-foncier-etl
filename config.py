@@ -467,6 +467,33 @@ MAX_PAGES_ABSOLU = 60  # garde-fou dur pour éviter un scroll infini (mode "dail
 # plafond.
 MAX_PAGES_ABSOLU_BACKFILL = 650
 
+# Seuil "sans nouveau post" dédié au mode "backfill", plus tolérant que
+# MAX_PAGES_SANS_NOUVEAU_POST (4, calibré pour le mode "daily" où tout post
+# déjà vu signifie vraiment qu'on a rattrapé le flux du jour).
+#
+# AJOUTÉ le 2026-08-12, diagnostic sur données réelles (annonces.xlsx /
+# runs.xlsx du 2026-08-12) : en comparant les groupes revisités plusieurs fois
+# en backfill, certains progressent nettement d'un run à l'autre (ex.
+# "Location de maison" 19->57j, "Immobilier Premier" 1->51j, "Le marché"
+# 1->18j) alors qu'une quinzaine d'autres restent bloqués à 6-7 jours malgré
+# des runs supplémentaires. Hypothèse la plus probable (pas prouvée avec
+# certitude - aucune télémétrie par groupe du motif d'arrêt n'existe encore) :
+# `seen_ids` est persisté entre runs (data/state/seen_post_ids.json), donc
+# revisiter un groupe déjà partiellement rattrapé fait immédiatement
+# réapparaître une zone dense de posts déjà vus en tout début de scroll, ce
+# qui déclenche l'arrêt à 4 étapes consécutives AVANT même d'atteindre la
+# frontière du contenu réellement nouveau plus profond.
+#
+# Valeur choisie : 10x le seuil "daily" (40). Raisonnement : assez de marge
+# pour traverser une zone de doublons sans interrompre prématurément un
+# groupe encore rattrapable, tout en gardant un arrêt fini pour ne pas
+# scroller indéfiniment sur un groupe réellement épuisé (dérive anti-
+# détection : un scroll qui ne s'arrête jamais est un signal suspect). Reste
+# un choix d'ingénieur, pas une valeur calculée à partir de données de
+# distribution des zones de doublons (données non disponibles) - à ajuster si
+# les prochains runs montrent qu'elle est trop basse ou trop haute.
+MAX_PAGES_SANS_NOUVEAU_POST_BACKFILL = 40
+
 NAVIGATION_TIMEOUT_MS = 30_000
 
 # Fragments d'URL identifiant une requête GraphQL Facebook (pour intercepter
