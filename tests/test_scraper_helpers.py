@@ -577,7 +577,16 @@ class TestRecupererProfondeurActuelleParGroupe:
     """Priorisation du backfill par profondeur DB (2026-08-13, voir
     prioriser_groupes_backfill) : lecture best-effort, ne doit jamais faire
     planter un run de scraping même si la DB est absente/injoignable.
+
+    Depuis la correction du bug "posts épinglés" du même jour, la requête
+    renvoie une ligne PAR ANNONCE (groupe_nom, date_publication), triée par
+    groupe puis date décroissante - la profondeur est calculée en Python en
+    remontant tant que l'écart entre deux posts consécutifs ne dépasse pas
+    `config.GAP_MAX_JOURS_PROFONDEUR_CONTINUE`.
     """
+
+    def _ligne(self, nom: str, date_iso: str) -> tuple:
+        return (nom, date_iso)
 
     def test_database_url_absente_retourne_dict_vide(self, monkeypatch):
         monkeypatch.setattr(config, "DATABASE_URL", "")
@@ -593,9 +602,14 @@ class TestRecupererProfondeurActuelleParGroupe:
         assert scraper.recuperer_profondeur_actuelle_par_groupe() == {}
 
     def test_cas_nominal_calcule_profondeur_et_densite(self, monkeypatch):
+        # Couverture continue simple : 3 posts espacés de 10 jours chacun
+        # (sous le seuil de 14j = config.GAP_MAX_JOURS_PROFONDEUR_CONTINUE),
+        # aucun écart ne dépasse le seuil -> toute la fenêtre compte.
         monkeypatch.setattr(config, "DATABASE_URL", "postgresql://x/y")
         lignes = [
-            ("Groupe A", 100, "2026-05-01T00:00:00+00:00", "2026-08-01T00:00:00+00:00"),
+            self._ligne("Groupe A", "2026-08-01T00:00:00+00:00"),
+            self._ligne("Groupe A", "2026-07-22T00:00:00+00:00"),
+            self._ligne("Groupe A", "2026-07-12T00:00:00+00:00"),
         ]
         monkeypatch.setattr(
             scraper.psycopg, "connect", lambda *_a, **_k: _FausseConnexionDB(lignes)
@@ -604,27 +618,61 @@ class TestRecupererProfondeurActuelleParGroupe:
         resultat = scraper.recuperer_profondeur_actuelle_par_groupe()
 
         assert set(resultat) == {"Groupe A"}
-        assert resultat["Groupe A"]["plus_ancien"] == datetime(2026, 5, 1, tzinfo=timezone.utc)
-        # 100 annonces / 92 jours d'écart (1er mai -> 1er août) ≈ 1.09/j
-        assert resultat["Groupe A"]["densite_annonces_jour"] == pytest.approx(100 / 92, rel=0.01)
+        assert resultat["Groupe A"]["plus_ancien"] == datetime(2026, 7, 12, tzinfo=timezone.utc)
+        # 3 annonces / 20 jours d'écart (12 juillet -> 1er août)
+        assert resultat["Groupe A"]["densite_annonces_jour"] == pytest.approx(3 / 20, rel=0.01)
 
-    def test_fenetre_trop_courte_donne_densite_none(self, monkeypatch):
-        # Moins d'un jour d'écart entre le plus ancien et le plus récent post
-        # observé - pas assez de recul pour une densité fiable.
+    def test_post_epingle_isole_ne_gonfle_pas_la_profondeur(self, monkeypatch):
+        # Régression du bug trouvé le 2026-08-13 sur "LOCATION DE MAISON &
+        # VENTE DE PARCELLE" : un post isolé de janvier, séparé du reste par
+        # un trou de 139 jours, ne doit PAS être compté comme profondeur
+        # atteinte - seule la couverture continue récente doit compter.
         monkeypatch.setattr(config, "DATABASE_URL", "postgresql://x/y")
         lignes = [
-            ("Groupe B", 5, "2026-08-01T10:00:00+00:00", "2026-08-01T12:00:00+00:00"),
+            self._ligne("Groupe B", "2026-08-03T10:00:00+00:00"),
+            self._ligne("Groupe B", "2026-08-01T00:00:00+00:00"),
+            self._ligne("Groupe B", "2026-07-25T00:00:00+00:00"),  # écart 7j, OK
+            self._ligne("Groupe B", "2026-01-27T00:00:00+00:00"),  # écart 179j, coupure
+            self._ligne("Groupe B", "2026-01-26T00:00:00+00:00"),  # au-delà de la coupure
         ]
         monkeypatch.setattr(
             scraper.psycopg, "connect", lambda *_a, **_k: _FausseConnexionDB(lignes)
         )
 
         resultat = scraper.recuperer_profondeur_actuelle_par_groupe()
-        assert resultat["Groupe B"]["densite_annonces_jour"] is None
+
+        # La couverture continue s'arrête au 25 juillet (pas à janvier).
+        assert resultat["Groupe B"]["plus_ancien"] == datetime(2026, 7, 25, tzinfo=timezone.utc)
+
+    def test_fenetre_continue_trop_courte_donne_densite_none(self, monkeypatch):
+        # Moins d'un jour d'écart dans la fenêtre continue - pas assez de
+        # recul pour une densité fiable.
+        monkeypatch.setattr(config, "DATABASE_URL", "postgresql://x/y")
+        lignes = [
+            self._ligne("Groupe C", "2026-08-01T12:00:00+00:00"),
+            self._ligne("Groupe C", "2026-08-01T10:00:00+00:00"),
+        ]
+        monkeypatch.setattr(
+            scraper.psycopg, "connect", lambda *_a, **_k: _FausseConnexionDB(lignes)
+        )
+
+        resultat = scraper.recuperer_profondeur_actuelle_par_groupe()
+        assert resultat["Groupe C"]["densite_annonces_jour"] is None
+
+    def test_un_seul_post_donne_densite_none_sans_planter(self, monkeypatch):
+        monkeypatch.setattr(config, "DATABASE_URL", "postgresql://x/y")
+        lignes = [self._ligne("Groupe D", "2026-08-01T00:00:00+00:00")]
+        monkeypatch.setattr(
+            scraper.psycopg, "connect", lambda *_a, **_k: _FausseConnexionDB(lignes)
+        )
+
+        resultat = scraper.recuperer_profondeur_actuelle_par_groupe()
+        assert resultat["Groupe D"]["plus_ancien"] == datetime(2026, 8, 1, tzinfo=timezone.utc)
+        assert resultat["Groupe D"]["densite_annonces_jour"] is None
 
     def test_date_invalide_est_ignoree(self, monkeypatch):
         monkeypatch.setattr(config, "DATABASE_URL", "postgresql://x/y")
-        lignes = [("Groupe C", 3, None, None)]
+        lignes = [self._ligne("Groupe E", None)]
         monkeypatch.setattr(
             scraper.psycopg, "connect", lambda *_a, **_k: _FausseConnexionDB(lignes)
         )

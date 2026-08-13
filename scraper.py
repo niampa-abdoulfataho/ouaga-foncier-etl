@@ -838,13 +838,35 @@ def appliquer_rotation_backfill(
 
 
 def recuperer_profondeur_actuelle_par_groupe() -> dict[str, dict[str, Any]]:
-    """Interroge la base maître pour connaître, PAR GROUPE, la date de
-    publication la plus ancienne déjà collectée (tous modes confondus - un
-    post "mis en avant" capté en mode daily compte aussi) ainsi qu'une
-    densité de publication approximative (annonces valides/jour, sur la
-    fenêtre déjà observée). Sert uniquement à ordonner les groupes à traiter
-    en priorité en mode backfill (voir `prioriser_groupes_backfill`) - une
-    lecture seule, aucune écriture, aucun impact sur le scraping lui-même.
+    """Interroge la base maître pour connaître, PAR GROUPE, la profondeur de
+    couverture CONTINUE déjà atteinte (voir ci-dessous pourquoi "continue" et
+    pas simplement MIN(date_publication)) ainsi qu'une densité de publication
+    approximative (annonces valides/jour, sur la fenêtre continue observée).
+    Sert uniquement à ordonner les groupes à traiter en priorité en mode
+    backfill (voir `prioriser_groupes_backfill`) - une lecture seule, aucune
+    écriture, aucun impact sur le scraping lui-même.
+
+    BUG CORRIGÉ le 2026-08-13 (trouvé en validant ce run avec des données
+    réelles, jamais en sandbox) : la première version utilisait
+    MIN(date_publication) brut sur tout le groupe. Or les posts "mis en
+    avant" (voir avertissement dans `scraper_groupe`) sont épinglés et
+    peuvent être arbitrairement anciens SANS que le reste du fil ait été
+    couvert - exemple réel sur "LOCATION DE MAISON & VENTE DE PARCELLE" :
+    2 posts isolés de janvier 2026, puis un trou de 139 jours avant le post
+    suivant, alors que la couverture réellement continue ne remonte qu'à
+    début août. MIN(date_publication) brut aurait donné ~198 jours de
+    "profondeur" à ce groupe (posts épinglés inclus) et l'aurait fait
+    classer à tort comme "objectif atteint", alors que sa vraie couverture
+    chronologique ininterrompue est de quelques jours seulement - l'exact
+    inverse de l'effet recherché par cette fonction.
+
+    Nouvelle méthode : pour chaque groupe, les dates de publication sont
+    triées de la plus récente à la plus ancienne, et on remonte tant que
+    l'écart entre deux posts consécutifs ne dépasse pas
+    `config.GAP_MAX_JOURS_PROFONDEUR_CONTINUE` - le premier écart plus grand
+    marque la fin de la couverture continue (probablement un post isolé/
+    épinglé au-delà). Densité et profondeur sont calculées uniquement sur
+    cette fenêtre continue.
 
     Best-effort explicitement assumé : si `DATABASE_URL` est absente ou la
     base injoignable, retourne un dict vide plutôt que de lever une
@@ -856,7 +878,7 @@ def recuperer_profondeur_actuelle_par_groupe() -> dict[str, dict[str, Any]]:
     Returns:
         Dict indexé par `groupe_nom`, chaque valeur étant
         {"plus_ancien": datetime, "densite_annonces_jour": float | None}.
-        `densite_annonces_jour` est None si la fenêtre observée est trop
+        `densite_annonces_jour` est None si la fenêtre continue est trop
         courte (< 1 jour, pas assez de recul pour une estimation fiable).
     """
     if not config.DATABASE_URL:
@@ -870,9 +892,9 @@ def recuperer_profondeur_actuelle_par_groupe() -> dict[str, dict[str, Any]]:
         with psycopg.connect(config.DATABASE_URL, connect_timeout=10) as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT groupe_nom, COUNT(*), MIN(date_publication), "
-                    "MAX(date_publication) FROM annonces "
-                    "WHERE date_publication IS NOT NULL GROUP BY groupe_nom"
+                    "SELECT groupe_nom, date_publication FROM annonces "
+                    "WHERE date_publication IS NOT NULL "
+                    "ORDER BY groupe_nom, date_publication DESC"
                 )
                 lignes = cur.fetchall()
     except psycopg.Error as exc:
@@ -883,16 +905,33 @@ def recuperer_profondeur_actuelle_par_groupe() -> dict[str, dict[str, Any]]:
         )
         return {}
 
-    resultat: dict[str, dict[str, Any]] = {}
-    for nom, nb_annonces, plus_ancien_str, plus_recent_str in lignes:
+    dates_par_groupe: dict[str, list[datetime]] = {}
+    for nom, date_str in lignes:
         try:
-            plus_ancien = datetime.fromisoformat(plus_ancien_str)
-            plus_recent = datetime.fromisoformat(plus_recent_str)
+            date_publication = datetime.fromisoformat(date_str)
         except (TypeError, ValueError):
             continue
-        span_jours = (plus_recent - plus_ancien).total_seconds() / 86_400
-        densite = nb_annonces / span_jours if span_jours >= 1 else None
-        resultat[nom] = {"plus_ancien": plus_ancien, "densite_annonces_jour": densite}
+        dates_par_groupe.setdefault(nom, []).append(date_publication)
+
+    seuil_gap = timedelta(days=config.GAP_MAX_JOURS_PROFONDEUR_CONTINUE)
+    resultat: dict[str, dict[str, Any]] = {}
+    for nom, dates in dates_par_groupe.items():
+        # `dates` déjà triées du plus récent au plus ancien (ORDER BY ... DESC).
+        plus_recent = dates[0]
+        nb_dans_fenetre = 1
+        plus_ancien_continu = dates[0]
+        for precedent, suivant in zip(dates, dates[1:]):
+            if precedent - suivant > seuil_gap:
+                break
+            plus_ancien_continu = suivant
+            nb_dans_fenetre += 1
+
+        span_jours = (plus_recent - plus_ancien_continu).total_seconds() / 86_400
+        densite = nb_dans_fenetre / span_jours if span_jours >= 1 else None
+        resultat[nom] = {
+            "plus_ancien": plus_ancien_continu,
+            "densite_annonces_jour": densite,
+        }
     return resultat
 
 

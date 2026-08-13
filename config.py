@@ -528,6 +528,32 @@ OBJECTIF_PROFONDEUR_BACKFILL_JOURS = 90
 POSTS_PAR_ETAPE_SCROLL_ESTIME = 3.4  # posts bruts capturés / étape de scroll, mesuré empiriquement
 RATIO_VALIDE_BRUT_BACKFILL_ESTIME = 0.18  # nb_valides / nb_posts_bruts, moyenne mesurée sur les runs backfill
 
+# BUG CORRIGÉ le 2026-08-13, le jour même du déploiement de la priorisation
+# ci-dessus, en validant le premier run réel avec des données réelles :
+# `recuperer_profondeur_actuelle_par_groupe` (scraper.py) utilisait
+# MIN(date_publication) brut par groupe, sans tenir compte des posts "mis en
+# avant" (épinglés, potentiellement très anciens - voir avertissement dans
+# `scraper_groupe`). Preuve concrète trouvée sur "LOCATION DE MAISON & VENTE
+# DE PARCELLE" : 2 posts isolés de janvier 2026 puis un trou de 139 jours
+# avant le post suivant, alors que la couverture réellement continue ne
+# remonte qu'à début août - MIN(date_publication) brut aurait donné ~198
+# jours de "profondeur" à ce groupe et l'aurait fait classer à tort comme
+# "objectif atteint" par `prioriser_groupes_backfill`, l'exact inverse de
+# l'effet recherché.
+#
+# GAP_MAX_JOURS_PROFONDEUR_CONTINUE définit l'écart maximal toléré entre deux
+# posts consécutifs (triés par date) pour les considérer comme faisant partie
+# de la même couverture continue - au-delà, on considère qu'on a atteint la
+# frontière d'un post isolé/épinglé, pas une vraie continuité de collecte.
+# Valeur choisie à partir des écarts RÉELS observés le 2026-08-13 : les posts
+# isolés/épinglés produisaient des trous de 36 à 139 jours, alors que le plus
+# grand écart légitime entre deux runs sur un même groupe observé jusqu'ici
+# était d'environ 8 jours. 14 jours (le double de cette marge légitime la
+# plus large observée) sépare clairement les deux cas sans être trop agressif
+# - à réévaluer si la fréquence des runs backfill change significativement
+# (des runs plus espacés élargiraient les écarts légitimes).
+GAP_MAX_JOURS_PROFONDEUR_CONTINUE = 14
+
 NAVIGATION_TIMEOUT_MS = 30_000
 
 # Fragments d'URL identifiant une requête GraphQL Facebook (pour intercepter
