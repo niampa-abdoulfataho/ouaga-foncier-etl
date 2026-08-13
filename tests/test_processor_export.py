@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import csv
 import json
+from types import SimpleNamespace
+
+import pytest
 
 import processor
 
@@ -54,6 +57,88 @@ class TestExporterJsonAudit:
         processor.exporter_json_audit(rejetes, chemin)
         contenu = json.loads(chemin.read_text(encoding="utf-8"))
         assert contenu == rejetes
+
+
+class _FauxCurseurExport:
+    def __init__(self, lignes, total_reel, colonnes=("id",)):
+        self._lignes = lignes
+        self._total_reel = total_reel
+        self.description = [SimpleNamespace(name=c) for c in colonnes]
+
+    def execute(self, *_args, **_kwargs):
+        pass
+
+    def fetchall(self):
+        return self._lignes
+
+    def fetchone(self):
+        return (self._total_reel,)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+class _FausseConnexionExport:
+    def __init__(self, lignes, total_reel, colonnes=("id",)):
+        self._lignes = lignes
+        self._total_reel = total_reel
+        self._colonnes = colonnes
+
+    def cursor(self):
+        return _FauxCurseurExport(self._lignes, self._total_reel, self._colonnes)
+
+    def commit(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class TestLireAnnoncesAvecVerification:
+    """Garde-fou ajouté le 2026-08-13 après deux exports xlsx consécutifs où
+    fetchall() a silencieusement renvoyé moins de lignes que le COUNT(*) réel
+    (7996->7000 puis 8374->5000, confirmés par l'utilisateur via Neon) -
+    jamais d'exception levée par psycopg, jamais détectable dans le fichier
+    produit lui-même. Voir le docstring de _lire_annonces_avec_verification.
+    """
+
+    def test_cas_nominal_lignes_et_count_coherents(self, monkeypatch):
+        lignes = [("p1",), ("p2",)]
+        monkeypatch.setattr(
+            processor.psycopg,
+            "connect",
+            lambda *_a, **_k: _FausseConnexionExport(lignes, total_reel=2),
+        )
+        colonnes, resultat = processor._lire_annonces_avec_verification("postgresql://x/y")
+        assert resultat == lignes
+        assert colonnes == ["id"]
+
+    def test_incoherence_resolue_a_la_deuxieme_tentative(self, monkeypatch):
+        # 1re connexion : 1 ligne récupérée contre 5 attendues (incohérent).
+        # 2e connexion (nouvelle) : cohérent -> doit réussir sans lever.
+        connexions = iter(
+            [
+                _FausseConnexionExport([("p1",)], total_reel=5),
+                _FausseConnexionExport([("p1",), ("p2",)], total_reel=2),
+            ]
+        )
+        monkeypatch.setattr(
+            processor.psycopg, "connect", lambda *_a, **_k: next(connexions)
+        )
+        colonnes, resultat = processor._lire_annonces_avec_verification("postgresql://x/y")
+        assert len(resultat) == 2
+
+    def test_incoherence_persistante_leve_runtime_error(self, monkeypatch):
+        monkeypatch.setattr(
+            processor.psycopg,
+            "connect",
+            lambda *_a, **_k: _FausseConnexionExport([("p1",)], total_reel=5),
+        )
+        with pytest.raises(RuntimeError, match="COUNT"):
+            processor._lire_annonces_avec_verification("postgresql://x/y")
 
 
 class TestChargerPostsBruts:

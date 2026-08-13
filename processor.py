@@ -473,6 +473,78 @@ def upsert_annonces(annonces: list[dict[str, Any]], dsn: str | None = None) -> i
     return nb_reussies
 
 
+_EXPORT_XLSX_SQL = (
+    "SELECT id, groupe_nom, url, date_publication, date_incertaine, type_bien, "
+    "quartier_zone, superficie_m2, prix_fcfa, statut_document, contacts_whatsapp, "
+    "mots_cles_pertinents, resume_court, texte_nettoye, premiere_collecte, derniere_maj "
+    "FROM annonces ORDER BY derniere_maj DESC"
+)
+
+
+def _lire_annonces_avec_verification(dsn: str) -> tuple[list[str], list[tuple]]:
+    """Exécute `_EXPORT_XLSX_SQL` et vérifie, DANS LA MÊME CONNEXION, que le
+    nombre de lignes récupérées correspond à un `SELECT COUNT(*)` fait juste
+    après - un seul essai supplémentaire avant d'abandonner.
+
+    AJOUTÉ le 2026-08-13, après DEUX exports consécutifs (7996->7000,
+    8374->5000, écarts confirmés via COUNT(*) manuel sur Neon par
+    l'utilisateur) où `fetchall()` a silencieusement renvoyé un
+    sous-ensemble aléatoire des lignes de la table - jamais d'exception
+    levée par psycopg, jamais de doublon ni d'incohérence détectable dans le
+    fichier produit (d'où la difficulté à le repérer sans comparaison
+    manuelle). Cause racine NON identifiée avec certitude (pas d'accès direct
+    à l'infrastructure Neon depuis ici pour investiguer plus loin - possible
+    piste : compute serverless qui se suspend/reprend en cours de transfert
+    d'un gros résultat) - cette fonction ne corrige pas la cause, elle la
+    détecte de façon fiable et automatique au lieu de compter sur une
+    vérification manuelle a posteriori.
+
+    Raises:
+        RuntimeError: le nombre de lignes ne correspond toujours pas au
+            COUNT(*) après une tentative de reconnexion - mieux vaut un run
+            qui échoue bruyamment ici (l'upsert, lui, a déjà réussi et n'est
+            pas remis en cause) qu'un export Excel silencieusement incomplet
+            qui fausse ensuite toute analyse faite dessus.
+    """
+    derniere_erreur = ""
+    for tentative in (1, 2):
+        conn = _connexion(dsn)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(_EXPORT_XLSX_SQL)
+                colonnes = [d.name for d in cur.description]
+                lignes = cur.fetchall()
+                cur.execute("SELECT COUNT(*) FROM annonces")
+                (total_reel,) = cur.fetchone()
+        finally:
+            conn.close()
+
+        if len(lignes) == total_reel:
+            if tentative == 2:
+                logger.info(
+                    "Export xlsx : incohérence résolue après reconnexion "
+                    "(tentative 1 avait renvoyé un nombre de lignes différent "
+                    "du COUNT(*) réel)."
+                )
+            return colonnes, lignes
+
+        derniere_erreur = (
+            f"tentative {tentative} : {len(lignes)} ligne(s) récupérée(s) "
+            f"par le SELECT contre {total_reel} selon COUNT(*) sur la même "
+            f"connexion - écart de {total_reel - len(lignes)} ligne(s)."
+        )
+        logger.warning("Export xlsx : incohérence détectée (%s)", derniere_erreur)
+
+    raise RuntimeError(
+        f"Export xlsx annulé après 2 tentatives : le nombre de lignes lues "
+        f"ne correspond toujours pas à COUNT(*) réel ({derniere_erreur}). "
+        f"La base elle-même n'est PAS en cause (l'upsert de ce run a réussi "
+        f"séparément) - c'est la lecture pour l'export qui est incohérente. "
+        f"Voir le commentaire de _lire_annonces_avec_verification pour le "
+        f"contexte (incidents du 2026-08-13)."
+    )
+
+
 def exporter_xlsx_depuis_db(dsn: str | None = None, chemin_xlsx: Path | None = None) -> Path:
     """Régénère UN SEUL fichier Excel à partir de l'état actuel de la base
     maître (écrasé à chaque run, pas de doublon de fichier). C'est une vue de
@@ -481,19 +553,7 @@ def exporter_xlsx_depuis_db(dsn: str | None = None, chemin_xlsx: Path | None = N
     dsn = dsn or config.DATABASE_URL
     chemin_xlsx = chemin_xlsx or config.MASTER_XLSX_PATH
 
-    conn = _connexion(dsn)
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, groupe_nom, url, date_publication, date_incertaine, type_bien, "
-                "quartier_zone, superficie_m2, prix_fcfa, statut_document, contacts_whatsapp, "
-                "mots_cles_pertinents, resume_court, texte_nettoye, premiere_collecte, derniere_maj "
-                "FROM annonces ORDER BY derniere_maj DESC"
-            )
-            colonnes = [d.name for d in cur.description]
-            lignes = cur.fetchall()
-    finally:
-        conn.close()
+    colonnes, lignes = _lire_annonces_avec_verification(dsn)
 
     classeur = Workbook()
     feuille = classeur.active
