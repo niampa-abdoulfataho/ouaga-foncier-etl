@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
+import psycopg
 import pytest
 
 import config
@@ -539,6 +540,175 @@ class TestRotationBackfill:
         groupes = [self._groupe(str(i)) for i in range(1, 4)]
         resultat = scraper.appliquer_rotation_backfill(groupes, dernier_id="999")
         assert resultat == groupes
+
+
+class _FauxCurseurDB:
+    def __init__(self, lignes):
+        self._lignes = lignes
+
+    def execute(self, *_args, **_kwargs):
+        pass
+
+    def fetchall(self):
+        return self._lignes
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+class _FausseConnexionDB:
+    def __init__(self, lignes):
+        self._lignes = lignes
+
+    def cursor(self):
+        return _FauxCurseurDB(self._lignes)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+class TestRecupererProfondeurActuelleParGroupe:
+    """Priorisation du backfill par profondeur DB (2026-08-13, voir
+    prioriser_groupes_backfill) : lecture best-effort, ne doit jamais faire
+    planter un run de scraping même si la DB est absente/injoignable.
+    """
+
+    def test_database_url_absente_retourne_dict_vide(self, monkeypatch):
+        monkeypatch.setattr(config, "DATABASE_URL", "")
+        assert scraper.recuperer_profondeur_actuelle_par_groupe() == {}
+
+    def test_erreur_psycopg_retourne_dict_vide_sans_planter(self, monkeypatch):
+        monkeypatch.setattr(config, "DATABASE_URL", "postgresql://x/y")
+
+        def _connect_qui_echoue(*_args, **_kwargs):
+            raise psycopg.OperationalError("base injoignable (test)")
+
+        monkeypatch.setattr(scraper.psycopg, "connect", _connect_qui_echoue)
+        assert scraper.recuperer_profondeur_actuelle_par_groupe() == {}
+
+    def test_cas_nominal_calcule_profondeur_et_densite(self, monkeypatch):
+        monkeypatch.setattr(config, "DATABASE_URL", "postgresql://x/y")
+        lignes = [
+            ("Groupe A", 100, "2026-05-01T00:00:00+00:00", "2026-08-01T00:00:00+00:00"),
+        ]
+        monkeypatch.setattr(
+            scraper.psycopg, "connect", lambda *_a, **_k: _FausseConnexionDB(lignes)
+        )
+
+        resultat = scraper.recuperer_profondeur_actuelle_par_groupe()
+
+        assert set(resultat) == {"Groupe A"}
+        assert resultat["Groupe A"]["plus_ancien"] == datetime(2026, 5, 1, tzinfo=timezone.utc)
+        # 100 annonces / 92 jours d'écart (1er mai -> 1er août) ≈ 1.09/j
+        assert resultat["Groupe A"]["densite_annonces_jour"] == pytest.approx(100 / 92, rel=0.01)
+
+    def test_fenetre_trop_courte_donne_densite_none(self, monkeypatch):
+        # Moins d'un jour d'écart entre le plus ancien et le plus récent post
+        # observé - pas assez de recul pour une densité fiable.
+        monkeypatch.setattr(config, "DATABASE_URL", "postgresql://x/y")
+        lignes = [
+            ("Groupe B", 5, "2026-08-01T10:00:00+00:00", "2026-08-01T12:00:00+00:00"),
+        ]
+        monkeypatch.setattr(
+            scraper.psycopg, "connect", lambda *_a, **_k: _FausseConnexionDB(lignes)
+        )
+
+        resultat = scraper.recuperer_profondeur_actuelle_par_groupe()
+        assert resultat["Groupe B"]["densite_annonces_jour"] is None
+
+    def test_date_invalide_est_ignoree(self, monkeypatch):
+        monkeypatch.setattr(config, "DATABASE_URL", "postgresql://x/y")
+        lignes = [("Groupe C", 3, None, None)]
+        monkeypatch.setattr(
+            scraper.psycopg, "connect", lambda *_a, **_k: _FausseConnexionDB(lignes)
+        )
+
+        assert scraper.recuperer_profondeur_actuelle_par_groupe() == {}
+
+
+class TestPrioriserGroupesBackfill:
+    """Tri des groupes backfill par urgence (2026-08-13) : priorise les
+    groupes sous l'objectif de profondeur ET dont la densité laisse penser
+    que l'objectif est réellement atteignable, au lieu de traiter tous les
+    groupes à égalité (voir le diagnostic détaillé dans config.py, commentaire
+    au-dessus de OBJECTIF_PROFONDEUR_BACKFILL_JOURS).
+    """
+
+    def _groupe(self, id_: str, nom: str) -> config.Groupe:
+        return config.Groupe(id=id_, nom=nom, url=f"https://x/{id_}/")
+
+    def test_dict_vide_retourne_liste_inchangee(self):
+        groupes = [self._groupe("1", "A"), self._groupe("2", "B")]
+        assert scraper.prioriser_groupes_backfill(groupes, {}) == groupes
+
+    def test_groupe_jamais_backfille_passe_devant_un_groupe_dense(self):
+        maintenant = datetime.now(timezone.utc)
+        groupes = [
+            self._groupe("1", "Dense"),
+            self._groupe("2", "JamaisBackfille"),
+        ]
+        profondeur = {
+            # Dense : encore loin de l'objectif (7j atteints sur 90), mais
+            # très forte densité -> énormément de runs restants estimés.
+            "Dense": {
+                "plus_ancien": maintenant - timedelta(days=7),
+                "densite_annonces_jour": 100.0,
+            },
+            # "JamaisBackfille" absent du dict -> traité en priorité maximale.
+        }
+        resultat = scraper.prioriser_groupes_backfill(groupes, profondeur, objectif_jours=90)
+        assert [g.nom for g in resultat] == ["JamaisBackfille", "Dense"]
+
+    def test_groupe_proche_objectif_passe_devant_groupe_dense_loin_de_lobjectif(self):
+        maintenant = datetime.now(timezone.utc)
+        groupes = [self._groupe("1", "Dense"), self._groupe("2", "ProcheObjectif")]
+        profondeur = {
+            "Dense": {
+                "plus_ancien": maintenant - timedelta(days=7),
+                "densite_annonces_jour": 100.0,  # très dense -> peu de progrès/run
+            },
+            "ProcheObjectif": {
+                "plus_ancien": maintenant - timedelta(days=85),
+                "densite_annonces_jour": 1.0,  # peu dense -> objectif presque atteint
+            },
+        }
+        resultat = scraper.prioriser_groupes_backfill(groupes, profondeur, objectif_jours=90)
+        assert [g.nom for g in resultat] == ["ProcheObjectif", "Dense"]
+
+    def test_groupe_deja_a_lobjectif_relegue_en_fin(self):
+        maintenant = datetime.now(timezone.utc)
+        groupes = [self._groupe("1", "DejaAtteint"), self._groupe("2", "EnRetard")]
+        profondeur = {
+            "DejaAtteint": {
+                "plus_ancien": maintenant - timedelta(days=120),
+                "densite_annonces_jour": 5.0,
+            },
+            "EnRetard": {
+                "plus_ancien": maintenant - timedelta(days=10),
+                "densite_annonces_jour": 5.0,
+            },
+        }
+        resultat = scraper.prioriser_groupes_backfill(groupes, profondeur, objectif_jours=90)
+        assert [g.nom for g in resultat] == ["EnRetard", "DejaAtteint"]
+
+    def test_densite_nulle_traitee_comme_priorite_optimiste_sans_division_par_zero(self):
+        maintenant = datetime.now(timezone.utc)
+        groupes = [self._groupe("1", "DensiteInconnue")]
+        profondeur = {
+            "DensiteInconnue": {
+                "plus_ancien": maintenant - timedelta(days=5),
+                "densite_annonces_jour": None,
+            },
+        }
+        # Ne doit pas lever ZeroDivisionError.
+        resultat = scraper.prioriser_groupes_backfill(groupes, profondeur, objectif_jours=90)
+        assert [g.nom for g in resultat] == ["DensiteInconnue"]
 
 
 class TestParserHorodatageRelatif:

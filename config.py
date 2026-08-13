@@ -494,6 +494,40 @@ MAX_PAGES_ABSOLU_BACKFILL = 650
 # les prochains runs montrent qu'elle est trop basse ou trop haute.
 MAX_PAGES_SANS_NOUVEAU_POST_BACKFILL = 40
 
+# AJOUTÉ le 2026-08-13, en réponse au constat que le fix ci-dessus (seuil 40)
+# n'a quasiment rien changé sur les groupes très denses : diagnostic sur
+# annonces.xlsx/runs.xlsx du 2026-08-13, comparant 6 runs backfill lancés
+# après le déploiement du seuil. Les 7 groupes touchés (tous plafonnés à 6-7
+# jours avant) n'ont gagné que +1 jour (4 groupes) ou +0 jour (3 groupes),
+# alors que le seuil "sans nouveau" est censé leur donner largement la marge
+# nécessaire. Explication retenue, cohérente avec les volumes bruts observés
+# (jusqu'à 2231 posts bruts capturés pour ~1,3 jour de fenêtre temporelle
+# couverte) : sur ces groupes, c'est MAX_PAGES_ABSOLU_BACKFILL (le plafond
+# dur de 650 étapes) qui est atteint AVANT le seuil "sans nouveau" - la
+# densité de publication (jusqu'à 100+ annonces valides/jour mesurées) rend
+# la profondeur atteignable par run mécaniquement bornée par le budget de
+# session (45 min), indépendamment du seuil "sans nouveau". Ce n'est PAS un
+# bug corrigible en ajustant encore un seuil : c'est une contrainte
+# structurelle (temps de session fixe x densité de publication variable), à
+# documenter comme telle plutôt qu'à masquer.
+#
+# Conséquence pratique : plutôt que de continuer à cibler tous les groupes
+# uniformément vers 90 jours (budget de runs gaspillé sur des groupes où
+# c'est structurellement hors de portée), la rotation backfill priorise
+# désormais les groupes selon leur profondeur restante ET leur densité (voir
+# `prioriser_groupes_backfill` dans scraper.py) - les groupes peu denses,
+# proches de l'objectif, passent devant les groupes très denses qui
+# nécessiteraient des dizaines de runs supplémentaires pour combler l'écart.
+#
+# Ces deux constantes sont des estimations EMPIRIQUES (mesurées sur les runs
+# backfill du 2026-08-05 au 2026-08-13, n=~25 runs), utilisées uniquement
+# pour ORDONNER les groupes à traiter en premier - une estimation imprécise
+# dégrade l'ordre de priorité mais ne casse rien (pas de condition d'arrêt
+# du scroll ni de garde-fou de sécurité basé dessus).
+OBJECTIF_PROFONDEUR_BACKFILL_JOURS = 90
+POSTS_PAR_ETAPE_SCROLL_ESTIME = 3.4  # posts bruts capturés / étape de scroll, mesuré empiriquement
+RATIO_VALIDE_BRUT_BACKFILL_ESTIME = 0.18  # nb_valides / nb_posts_bruts, moyenne mesurée sur les runs backfill
+
 NAVIGATION_TIMEOUT_MS = 30_000
 
 # Fragments d'URL identifiant une requête GraphQL Facebook (pour intercepter

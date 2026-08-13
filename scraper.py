@@ -70,6 +70,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+import psycopg
 from playwright.async_api import (
     Browser,
     BrowserContext,
@@ -836,6 +837,129 @@ def appliquer_rotation_backfill(
     return groupes[position + 1 :] + groupes[: position + 1]
 
 
+def recuperer_profondeur_actuelle_par_groupe() -> dict[str, dict[str, Any]]:
+    """Interroge la base maître pour connaître, PAR GROUPE, la date de
+    publication la plus ancienne déjà collectée (tous modes confondus - un
+    post "mis en avant" capté en mode daily compte aussi) ainsi qu'une
+    densité de publication approximative (annonces valides/jour, sur la
+    fenêtre déjà observée). Sert uniquement à ordonner les groupes à traiter
+    en priorité en mode backfill (voir `prioriser_groupes_backfill`) - une
+    lecture seule, aucune écriture, aucun impact sur le scraping lui-même.
+
+    Best-effort explicitement assumé : si `DATABASE_URL` est absente ou la
+    base injoignable, retourne un dict vide plutôt que de lever une
+    exception - un run de scraping ne doit jamais échouer à cause d'une
+    optimisation de priorisation. L'appelant retombe alors sur la rotation
+    round-robin existante (`appliquer_rotation_backfill`), qui reste le
+    mécanisme de repli garanti.
+
+    Returns:
+        Dict indexé par `groupe_nom`, chaque valeur étant
+        {"plus_ancien": datetime, "densite_annonces_jour": float | None}.
+        `densite_annonces_jour` est None si la fenêtre observée est trop
+        courte (< 1 jour, pas assez de recul pour une estimation fiable).
+    """
+    if not config.DATABASE_URL:
+        logger.warning(
+            "DATABASE_URL absente - priorisation du backfill par profondeur "
+            "désactivée, repli sur la rotation round-robin."
+        )
+        return {}
+
+    try:
+        with psycopg.connect(config.DATABASE_URL, connect_timeout=10) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT groupe_nom, COUNT(*), MIN(date_publication), "
+                    "MAX(date_publication) FROM annonces "
+                    "WHERE date_publication IS NOT NULL GROUP BY groupe_nom"
+                )
+                lignes = cur.fetchall()
+    except psycopg.Error as exc:
+        logger.warning(
+            "Lecture de la profondeur actuelle par groupe impossible (%s) - "
+            "repli sur la rotation round-robin.",
+            exc,
+        )
+        return {}
+
+    resultat: dict[str, dict[str, Any]] = {}
+    for nom, nb_annonces, plus_ancien_str, plus_recent_str in lignes:
+        try:
+            plus_ancien = datetime.fromisoformat(plus_ancien_str)
+            plus_recent = datetime.fromisoformat(plus_recent_str)
+        except (TypeError, ValueError):
+            continue
+        span_jours = (plus_recent - plus_ancien).total_seconds() / 86_400
+        densite = nb_annonces / span_jours if span_jours >= 1 else None
+        resultat[nom] = {"plus_ancien": plus_ancien, "densite_annonces_jour": densite}
+    return resultat
+
+
+def prioriser_groupes_backfill(
+    groupes: list["config.Groupe"],
+    profondeur_par_groupe: dict[str, dict[str, Any]],
+    objectif_jours: int = config.OBJECTIF_PROFONDEUR_BACKFILL_JOURS,
+) -> list["config.Groupe"]:
+    """Réordonne les groupes backfill par urgence décroissante, à partir de
+    leur profondeur DB actuelle plutôt que de la seule position dans
+    `groups.csv` (voir `appliquer_rotation_backfill`, qui reste appliquée
+    en aval comme filet de sécurité / départage entre groupes à égalité).
+
+    AJOUTÉ le 2026-08-13 : la rotation round-robin seule traite tous les
+    groupes de façon équitable en nombre de runs, mais pas en résultat -
+    diagnostic réel montrant que les groupes très denses (>20 annonces
+    valides/jour) plafonnent structurellement à 6-8 jours de profondeur quel
+    que soit le nombre de runs (voir MAX_PAGES_SANS_NOUVEAU_POST_BACKFILL,
+    commentaire détaillé), alors que les groupes peu denses dépassent
+    facilement 90 jours en quelques runs. Continuer à les traiter à égalité
+    gaspille des runs sur des groupes où l'objectif est hors de portée au
+    lieu de les concentrer sur ceux où il est atteignable.
+
+    Méthode : pour chaque groupe encore sous l'objectif, estime le nombre de
+    runs encore nécessaires via le modèle
+        jours_captures_par_run ≈ (MAX_PAGES_ABSOLU_BACKFILL x
+            POSTS_PAR_ETAPE_SCROLL_ESTIME x RATIO_VALIDE_BRUT_BACKFILL_ESTIME)
+            / densite_annonces_jour
+    puis trie par nombre de runs restants croissant (les groupes les plus
+    proches de l'objectif, donc les plus rentables à pousser, en premier).
+    Les groupes déjà à l'objectif ou au-delà passent en dernier (toujours
+    revisités, jamais exclus). Les groupes sans donnée de densité fiable
+    (jamais backfillés, ou fenêtre observée < 1 jour) sont traités avec
+    l'hypothèse la plus optimiste (comme si l'objectif était atteignable en
+    1 run) - on préfère leur donner une chance plutôt que de les reléguer
+    sans connaître leur vraie densité.
+
+    Limite assumée : le modèle de jours/run est une estimation empirique
+    (voir commentaire config.py sur les deux constantes), pas une garantie -
+    une estimation imprécise dégrade l'ordre de priorité, elle ne bloque
+    rien et ne fait planter aucun run.
+    """
+    if not profondeur_par_groupe:
+        return groupes
+
+    maintenant = datetime.now(timezone.utc)
+    jours_par_run_plein = (
+        config.MAX_PAGES_ABSOLU_BACKFILL
+        * config.POSTS_PAR_ETAPE_SCROLL_ESTIME
+        * config.RATIO_VALIDE_BRUT_BACKFILL_ESTIME
+    )
+
+    def runs_restants(groupe: "config.Groupe") -> float:
+        stats = profondeur_par_groupe.get(groupe.nom)
+        if stats is None:
+            return 0.0  # jamais backfillé -> priorité maximale, hypothèse optimiste
+        jours_restants = objectif_jours - (maintenant - stats["plus_ancien"]).days
+        if jours_restants <= 0:
+            return float("inf")  # objectif déjà atteint -> priorité minimale
+        densite = stats["densite_annonces_jour"]
+        if not densite or densite <= 0:
+            return 0.0  # densité inconnue -> hypothèse optimiste, comme "jamais backfillé"
+        return jours_restants / (jours_par_run_plein / densite)
+
+    return sorted(groupes, key=runs_restants)
+
+
 def verifier_cooldown() -> datetime | None:
     """Retourne la date de fin de cooldown si un cooldown est encore actif, sinon None.
 
@@ -1287,6 +1411,19 @@ async def executer_scraping(
         group_limit: nombre max de groupes traités sur ce run (None = tous).
         groups_batch_size: taille des lots de groupes entre deux pauses longues.
 
+    En mode "backfill", l'ordre des groupes traités n'est plus un simple
+    round-robin (`appliquer_rotation_backfill`) : depuis le 2026-08-13, il
+    est d'abord priorisé par profondeur DB actuelle et densité de
+    publication (`recuperer_profondeur_actuelle_par_groupe` +
+    `prioriser_groupes_backfill`), pour concentrer les runs sur les groupes
+    où `OBJECTIF_PROFONDEUR_BACKFILL_JOURS` (90j) est réellement atteignable,
+    plutôt que de les traiter à égalité avec des groupes structurellement
+    plafonnés par leur densité (voir le commentaire détaillé dans config.py).
+    La rotation round-robin reste appliquée en amont, comme départage entre
+    groupes de priorité égale et comme filet de sécurité si la DB est
+    injoignable (la priorisation retombe alors sur l'ordre round-robin,
+    sans faire échouer le run).
+
     Returns:
         Liste des chemins des fichiers JSON bruts sauvegardés (un par groupe).
 
@@ -1323,6 +1460,12 @@ async def executer_scraping(
         groupes_actifs = config.charger_groupes(limite=None)
         dernier_id_backfill = charger_rotation_backfill()
         groupes_actifs = appliquer_rotation_backfill(groupes_actifs, dernier_id_backfill)
+        # Priorisation par profondeur DB (voir prioriser_groupes_backfill) :
+        # appliquée APRÈS la rotation round-robin, qui reste le départage
+        # entre groupes à égalité de priorité (ex. plusieurs jamais
+        # backfillés) et le seul mécanisme actif si la DB est injoignable.
+        profondeur_par_groupe = recuperer_profondeur_actuelle_par_groupe()
+        groupes_actifs = prioriser_groupes_backfill(groupes_actifs, profondeur_par_groupe)
         groupes = groupes_actifs[:group_limit] if group_limit else groupes_actifs
     else:
         groupes = config.charger_groupes(limite=group_limit)
