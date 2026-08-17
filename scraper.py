@@ -837,6 +837,28 @@ def appliquer_rotation_backfill(
     return groupes[position + 1 :] + groupes[: position + 1]
 
 
+def _filtrer_par_groupe_id(
+    groupes: list["config.Groupe"], groupe_id: str
+) -> list["config.Groupe"]:
+    """Réduit la liste de groupes actifs à UN SEUL groupe, ciblé par id
+    (voir `executer_scraping`, paramètre `groupe_id`).
+
+    Raises:
+        ValueError: id absent de la liste des groupes actifs (typo, groupe
+            désactivé/retiré de groups.csv, ou id de la mauvaise colonne) -
+            échoue bruyamment plutôt que de silencieusement traiter 0 ou
+            tous les groupes, ce qui passerait inaperçu dans les logs.
+    """
+    for groupe in groupes:
+        if groupe.id == groupe_id:
+            return [groupe]
+    raise ValueError(
+        f"Groupe id={groupe_id!r} introuvable parmi les groupes actifs "
+        f"(voir groups.csv) - vérifiez l'id (celui de l'URL Facebook, pas "
+        f"le nom affiché)."
+    )
+
+
 def recuperer_profondeur_actuelle_par_groupe() -> dict[str, dict[str, Any]]:
     """Interroge la base maître pour connaître, PAR GROUPE, la profondeur de
     couverture CONTINUE déjà atteinte (voir ci-dessous pourquoi "continue" et
@@ -1431,6 +1453,7 @@ async def executer_scraping(
     days_back: int,
     group_limit: int | None,
     groups_batch_size: int,
+    groupe_id: str | None = None,
 ) -> list[Path]:
     """Point d'entrée principal du module, appelé par main.py.
 
@@ -1449,6 +1472,13 @@ async def executer_scraping(
             du navigateur headless et réduire le risque de détection).
         group_limit: nombre max de groupes traités sur ce run (None = tous).
         groups_batch_size: taille des lots de groupes entre deux pauses longues.
+        groupe_id: si fourni, ignore la rotation ET la priorisation
+            automatique (voir plus bas) pour ne traiter QUE ce groupe précis -
+            ajouté le 2026-08-13 pour permettre de cibler manuellement un
+            groupe (ex. un groupe proche de l'objectif de profondeur qu'on
+            veut pousser volontairement, sans attendre son tour de
+            priorisation automatique). `group_limit` n'a alors plus d'effet
+            (un seul groupe de toute façon).
 
     En mode "backfill", l'ordre des groupes traités n'est plus un simple
     round-robin (`appliquer_rotation_backfill`) : depuis le 2026-08-13, il
@@ -1489,13 +1519,17 @@ async def executer_scraping(
         raise ValueError(f"Variable d'environnement {config.ENV_FB_COOKIES} absente.")
     cookies = charger_cookies(cookies_json)
 
-    # En mode backfill, la rotation s'applique AVANT group_limit : on
-    # réordonne la liste complète des groupes actifs pour démarrer juste
-    # après le dernier tenté au run précédent, puis seulement group_limit
-    # tronque à N groupes sur cette liste réordonnée (sinon group_limit
-    # retomberait toujours sur les mêmes premiers groupes de groups.csv,
-    # rotation ou pas).
-    if mode == "backfill":
+    if groupe_id:
+        # Ciblage manuel explicite : court-circuite rotation ET priorisation
+        # automatique, group_limit n'a plus de sens (un seul groupe).
+        groupes = _filtrer_par_groupe_id(config.charger_groupes(limite=None), groupe_id)
+    elif mode == "backfill":
+        # En mode backfill, la rotation s'applique AVANT group_limit : on
+        # réordonne la liste complète des groupes actifs pour démarrer juste
+        # après le dernier tenté au run précédent, puis seulement group_limit
+        # tronque à N groupes sur cette liste réordonnée (sinon group_limit
+        # retomberait toujours sur les mêmes premiers groupes de groups.csv,
+        # rotation ou pas).
         groupes_actifs = config.charger_groupes(limite=None)
         dernier_id_backfill = charger_rotation_backfill()
         groupes_actifs = appliquer_rotation_backfill(groupes_actifs, dernier_id_backfill)

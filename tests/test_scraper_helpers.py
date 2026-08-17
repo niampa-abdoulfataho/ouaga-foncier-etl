@@ -497,6 +497,26 @@ class TestSeenIds:
         assert scraper.charger_seen_ids() == {}
 
 
+class TestFiltrerParGroupeId:
+    """Ciblage manuel d'un groupe précis (2026-08-13, voir executer_scraping,
+    paramètre `groupe_id`) - permet de pousser volontairement un groupe sans
+    attendre son tour de rotation/priorisation automatique.
+    """
+
+    def _groupe(self, id_: str) -> config.Groupe:
+        return config.Groupe(id=id_, nom=f"Groupe {id_}", url=f"https://x/{id_}/")
+
+    def test_groupe_trouve_retourne_liste_dun_seul_element(self):
+        groupes = [self._groupe("1"), self._groupe("2"), self._groupe("3")]
+        resultat = scraper._filtrer_par_groupe_id(groupes, "2")
+        assert [g.id for g in resultat] == ["2"]
+
+    def test_groupe_introuvable_leve_value_error(self):
+        groupes = [self._groupe("1"), self._groupe("2")]
+        with pytest.raises(ValueError, match="introuvable"):
+            scraper._filtrer_par_groupe_id(groupes, "999")
+
+
 class TestRotationBackfill:
     """Mécanisme de reprise entre runs backfill (2026-08-07, voir config.py -
     ROTATION_BACKFILL_PATH) : sans lui, group_limit retombait toujours sur

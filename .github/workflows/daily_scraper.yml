@@ -29,6 +29,10 @@ on:
         description: "Taille des lots de groupes entre deux pauses longues anti-détection"
         type: string
         default: "5"
+      group_id:
+        description: "Cibler UN SEUL groupe/page par son id (voir groups.csv) - ignore la rotation/priorisation automatique du backfill. Laisser vide pour le comportement normal."
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -130,11 +134,13 @@ jobs:
             echo "days_back=1" >> "$GITHUB_OUTPUT"
             echo "group_limit=0" >> "$GITHUB_OUTPUT"
             echo "batch_size=5" >> "$GITHUB_OUTPUT"
+            echo "group_id=" >> "$GITHUB_OUTPUT"
           else
             echo "mode=${{ github.event.inputs.mode }}" >> "$GITHUB_OUTPUT"
             echo "days_back=${{ github.event.inputs.days_back }}" >> "$GITHUB_OUTPUT"
             echo "group_limit=${{ github.event.inputs.group_limit }}" >> "$GITHUB_OUTPUT"
             echo "batch_size=${{ github.event.inputs.batch_size }}" >> "$GITHUB_OUTPUT"
+            echo "group_id=${{ github.event.inputs.group_id }}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: "Exécution du pipeline ETL"
@@ -147,6 +153,7 @@ jobs:
         run: |
           python main.py \
             --mode "${{ steps.params.outputs.mode }}" \
+            ${{ steps.params.outputs.group_id != '' && format('--group-id "{0}"', steps.params.outputs.group_id) || '' }} \
             --days-back "${{ steps.params.outputs.days_back }}" \
             --group-limit "${{ steps.params.outputs.group_limit }}" \
             --batch-size "${{ steps.params.outputs.batch_size }}"

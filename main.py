@@ -69,6 +69,16 @@ def parser_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help="Exécute uniquement le scraping + filtrage regex (Étape A), sans appeler l'API Claude. "
         "Utile pour tester/débugger le scraper sans consommer de crédits API.",
     )
+    parseur.add_argument(
+        "--group-id",
+        type=str,
+        default=None,
+        help="Cible un seul groupe/page précis par son id (celui de l'URL Facebook, "
+        "voir groups.csv) - ignore la rotation ET la priorisation automatique du "
+        "mode backfill. Utile pour pousser volontairement un groupe précis (ex. "
+        "proche de l'objectif de profondeur) sans attendre son tour. Si absent "
+        "(défaut), le comportement normal (rotation + priorisation) s'applique.",
+    )
     args = parseur.parse_args(argv)
 
     if args.days_back is None:
@@ -133,12 +143,14 @@ def _ecrire_resume_github_actions(resultat: processor.ResultatTraitement) -> Non
 
 async def executer(args: argparse.Namespace) -> Path | processor.ResultatTraitement:
     logger.info(
-        "=== Démarrage pipeline | mode=%s days_back=%d group_limit=%s batch_size=%d skip_llm=%s ===",
+        "=== Démarrage pipeline | mode=%s days_back=%d group_limit=%s batch_size=%d "
+        "skip_llm=%s group_id=%s ===",
         args.mode,
         args.days_back,
         args.group_limit or "tous",
         args.batch_size,
         args.skip_llm,
+        args.group_id or "aucun (rotation/priorisation normale)",
     )
 
     fichiers_bruts = await scraper.executer_scraping(
@@ -146,6 +158,7 @@ async def executer(args: argparse.Namespace) -> Path | processor.ResultatTraitem
         days_back=args.days_back,
         group_limit=args.group_limit or None,
         groups_batch_size=args.batch_size,
+        groupe_id=args.group_id,
     )
 
     if not fichiers_bruts:

@@ -56,6 +56,14 @@ class TestParserArguments:
         args = main.parser_arguments(["--skip-llm"])
         assert args.skip_llm is True
 
+    def test_group_id_absent_par_defaut(self):
+        args = main.parser_arguments([])
+        assert args.group_id is None
+
+    def test_group_id_explicite_est_respecte(self):
+        args = main.parser_arguments(["--group-id", "1014671535986718"])
+        assert args.group_id == "1014671535986718"
+
 
 class TestMainEndToEnd:
     def test_aucun_post_collecte_traite_quand_meme_via_la_db_maitre(
@@ -105,6 +113,15 @@ class TestMainEndToEnd:
         )
         code = main.main(["--mode", "daily"])
         assert code == 0
+
+    def test_group_id_est_transmis_a_executer_scraping(
+        self, monkeypatch, repertoires_isoles
+    ):
+        appel = AsyncMock(return_value=[])
+        monkeypatch.setattr(scraper, "executer_scraping", appel)
+        main.main(["--mode", "backfill", "--group-id", "1014671535986718"])
+        appel.assert_awaited_once()
+        assert appel.await_args.kwargs["groupe_id"] == "1014671535986718"
 
     def test_pipeline_complet_appelle_processor(self, monkeypatch, repertoires_isoles, tmp_path):
         faux_fichier = tmp_path / "posts.json"
