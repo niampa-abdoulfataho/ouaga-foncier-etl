@@ -1203,6 +1203,86 @@ def sauvegarder_posts_groupe(posts: list[dict[str, Any]], groupe_id: str) -> Pat
 # --------------------------------------------------------------------------- #
 
 
+@dataclass(frozen=True)
+class ResultatScrapingGroupe:
+    """Résultat de `scraper_groupe`, avec télémétrie du scroll.
+
+    AJOUTÉ le 2026-08-17, en réponse à une question concrète (faut-il monter
+    `MAX_PAGES_ABSOLU_BACKFILL` à 2000 pour gagner en profondeur ?) à
+    laquelle on ne pouvait répondre qu'en devinant, faute de savoir quel
+    motif d'arrêt touche réellement chaque groupe. Avant, seul le nombre de
+    POSTS était retourné - impossible de distinguer "a épuisé le contenu
+    disponible" (motif_arret="sans_nouveau" ou "hors_fenetre", augmenter le
+    plafond ne changerait rien) de "a été coupé net par le plafond"
+    (motif_arret="plafond_absolu", seul cas où l'augmenter aiderait).
+    """
+
+    posts: list[dict[str, Any]]
+    etapes_scroll: int
+    motif_arret: str  # "hors_fenetre" | "sans_nouveau" | "plafond_absolu" | "timeout_navigation"
+
+
+_TELEMETRIE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS scroll_telemetrie (
+    id SERIAL PRIMARY KEY,
+    horodatage TIMESTAMPTZ NOT NULL,
+    mode TEXT NOT NULL,
+    groupe_id TEXT NOT NULL,
+    groupe_nom TEXT NOT NULL,
+    etapes_scroll INTEGER NOT NULL,
+    motif_arret TEXT NOT NULL,
+    nb_posts INTEGER NOT NULL
+);
+"""
+
+
+def enregistrer_telemetrie_scroll(
+    mode: str,
+    groupe: "config.Groupe",
+    etapes_scroll: int,
+    motif_arret: str,
+    nb_posts: int,
+) -> None:
+    """Enregistre le nombre d'étapes de scroll réellement exécutées et le
+    motif d'arrêt exact pour CE groupe et CE run - voir ResultatScrapingGroupe
+    pour le contexte. Permet de répondre avec des données réelles à "faut-il
+    monter le plafond de scroll" au lieu de le déduire indirectement des
+    volumes de posts ou de deviner.
+
+    Best-effort assumé (même philosophie que `recuperer_profondeur_actuelle_par_groupe`) :
+    ne doit jamais faire échouer un run de scraping. Crée sa propre table
+    (indépendante du schéma géré par processor.py) pour ne pas dépendre de
+    l'ordre d'exécution entre les deux modules.
+    """
+    if not config.DATABASE_URL:
+        return
+    try:
+        with psycopg.connect(config.DATABASE_URL, connect_timeout=10) as conn:
+            with conn.cursor() as cur:
+                cur.execute(_TELEMETRIE_SCHEMA_SQL)
+                cur.execute(
+                    "INSERT INTO scroll_telemetrie "
+                    "(horodatage, mode, groupe_id, groupe_nom, etapes_scroll, motif_arret, nb_posts) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        datetime.now(timezone.utc),
+                        mode,
+                        groupe.id,
+                        groupe.nom,
+                        etapes_scroll,
+                        motif_arret,
+                        nb_posts,
+                    ),
+                )
+            conn.commit()
+    except psycopg.Error as exc:
+        logger.warning(
+            "Enregistrement de la télémétrie de scroll impossible pour %s (%s) - ignoré.",
+            groupe.nom,
+            exc,
+        )
+
+
 async def scraper_groupe(
     context: BrowserContext,
     groupe: "config.Groupe",
@@ -1211,7 +1291,7 @@ async def scraper_groupe(
     delai_multiplicateur: float = 1.0,
     max_pages_absolu: int = config.MAX_PAGES_ABSOLU,
     max_pages_sans_nouveau: int = config.MAX_PAGES_SANS_NOUVEAU_POST,
-) -> list[dict[str, Any]]:
+) -> ResultatScrapingGroupe:
     """Parcourt un groupe Facebook (web.facebook.com, scroll simulé + capture
     réseau GraphQL) et retourne les nouveaux posts non vus.
 
@@ -1267,6 +1347,13 @@ async def scraper_groupe(
     nouveaux_posts: list[dict[str, Any]] = []
     posts_captures: list[dict[str, Any]] = []
     taches_en_cours: set[asyncio.Task] = set()
+    # Initialisés ici (avant le try) et pas seulement dans la boucle de
+    # scroll : un PlaywrightTimeoutError peut survenir dès `page.goto()`,
+    # avant même que la boucle ne démarre - sans cette init, le `return`
+    # final lèverait NameError au lieu de renvoyer une télémétrie cohérente
+    # ("0 étape, timeout") pour ce cas.
+    etapes_scroll = 0
+    motif_arret = "timeout_navigation"
 
     async def _traiter_reponse_graphql(reponse: Any) -> None:
         """Parse une réponse réseau GraphQL et accumule les posts trouvés dans
@@ -1358,6 +1445,11 @@ async def scraper_groupe(
 
         etapes_sans_nouveau = 0
         etapes_scroll = 0
+        # On a dépassé page.goto() et l'extraction initiale sans erreur : le
+        # motif par défaut devient "plafond_absolu" (sortie naturelle de la
+        # boucle ci-dessous), écrasé par les deux `break` explicites si l'un
+        # d'eux se déclenche avant.
+        motif_arret = "plafond_absolu"
 
         while etapes_scroll < max_pages_absolu:
             debut_capture = len(posts_captures)
@@ -1411,6 +1503,7 @@ async def scraper_groupe(
                         groupe.nom,
                         max_days_back,
                     )
+                    motif_arret = "hors_fenetre"
                     break
 
             if etapes_sans_nouveau >= max_pages_sans_nouveau:
@@ -1421,6 +1514,7 @@ async def scraper_groupe(
                     etapes_sans_nouveau,
                     max_pages_sans_nouveau,
                 )
+                motif_arret = "sans_nouveau"
                 break
 
             etapes_scroll += 1
@@ -1434,13 +1528,16 @@ async def scraper_groupe(
 
     except PlaywrightTimeoutError as exc:
         logger.error("Timeout navigation sur le groupe %s : %s", groupe.nom, exc)
+        motif_arret = "timeout_navigation"
     finally:
         page.remove_listener("response", _sur_reponse)
         if taches_en_cours:
             await asyncio.gather(*list(taches_en_cours), return_exceptions=True)
         await page.close()
 
-    return nouveaux_posts
+    return ResultatScrapingGroupe(
+        posts=nouveaux_posts, etapes_scroll=etapes_scroll, motif_arret=motif_arret
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1619,7 +1716,7 @@ async def executer_scraping(
 
                     dernier_groupe_id_tente = groupe.id
                     try:
-                        posts = await scraper_groupe(
+                        resultat_scraping = await scraper_groupe(
                             contexte,
                             groupe,
                             days_back,
@@ -1665,6 +1762,7 @@ async def executer_scraping(
                         anomalies += 1
                         continue
 
+                    posts = resultat_scraping.posts
                     if posts:
                         fichiers_sauvegardes.append(
                             sauvegarder_posts_groupe(posts, groupe.id)
@@ -1672,6 +1770,13 @@ async def executer_scraping(
                     sauvegarder_seen_ids(
                         seen_ids
                     )  # sauvegarde après CHAQUE groupe (résilience coupure)
+                    enregistrer_telemetrie_scroll(
+                        mode,
+                        groupe,
+                        resultat_scraping.etapes_scroll,
+                        resultat_scraping.motif_arret,
+                        len(posts),
+                    )
 
                     # Pause humaine entre deux groupes du même batch (pas seulement entre pages).
                     if i < len(lot) - 1:

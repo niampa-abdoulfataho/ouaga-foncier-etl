@@ -593,6 +593,84 @@ class _FausseConnexionDB:
         return False
 
 
+class _FauxCurseurTelemetrie:
+    def __init__(self, appels):
+        self._appels = appels
+
+    def execute(self, sql, params=None):
+        self._appels.append((sql, params))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+class _FausseConnexionTelemetrie:
+    def __init__(self):
+        self.appels = []
+        self.commit_appele = False
+
+    def cursor(self):
+        return _FauxCurseurTelemetrie(self.appels)
+
+    def commit(self):
+        self.commit_appele = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+class TestEnregistrerTelemetrieScroll:
+    """Télémétrie par groupe (étapes de scroll réelles + motif d'arrêt exact),
+    ajoutée le 2026-08-17 pour trancher objectivement des questions comme
+    "faut-il monter MAX_PAGES_ABSOLU_BACKFILL" au lieu de deviner. Même
+    philosophie best-effort que recuperer_profondeur_actuelle_par_groupe :
+    ne doit jamais faire échouer un run de scraping.
+    """
+
+    def _groupe(self) -> config.Groupe:
+        return config.Groupe(id="188036519697356", nom="Groupe Test", url="https://x/")
+
+    def test_database_url_absente_ne_fait_rien(self, monkeypatch):
+        monkeypatch.setattr(config, "DATABASE_URL", "")
+
+        def _connect_qui_ne_devrait_pas_etre_appele(*_a, **_k):
+            raise AssertionError("psycopg.connect ne devrait pas être appelé")
+
+        monkeypatch.setattr(scraper.psycopg, "connect", _connect_qui_ne_devrait_pas_etre_appele)
+        scraper.enregistrer_telemetrie_scroll("backfill", self._groupe(), 42, "plafond_absolu", 17)
+
+    def test_erreur_psycopg_est_avalee_sans_planter(self, monkeypatch):
+        monkeypatch.setattr(config, "DATABASE_URL", "postgresql://x/y")
+
+        def _connect_qui_echoue(*_a, **_k):
+            raise psycopg.OperationalError("base injoignable (test)")
+
+        monkeypatch.setattr(scraper.psycopg, "connect", _connect_qui_echoue)
+        # Ne doit lever aucune exception.
+        scraper.enregistrer_telemetrie_scroll("backfill", self._groupe(), 42, "plafond_absolu", 17)
+
+    def test_cas_nominal_insere_avec_les_bons_parametres(self, monkeypatch):
+        monkeypatch.setattr(config, "DATABASE_URL", "postgresql://x/y")
+        fausse_connexion = _FausseConnexionTelemetrie()
+        monkeypatch.setattr(scraper.psycopg, "connect", lambda *_a, **_k: fausse_connexion)
+
+        scraper.enregistrer_telemetrie_scroll(
+            "backfill", self._groupe(), 42, "plafond_absolu", 17
+        )
+
+        assert fausse_connexion.commit_appele is True
+        # Le 2e appel execute() est l'INSERT (le 1er crée la table).
+        sql_insert, params_insert = fausse_connexion.appels[1]
+        assert "INSERT INTO scroll_telemetrie" in sql_insert
+        assert params_insert[1:] == ("backfill", "188036519697356", "Groupe Test", 42, "plafond_absolu", 17)
+
+
 class TestRecupererProfondeurActuelleParGroupe:
     """Priorisation du backfill par profondeur DB (2026-08-13, voir
     prioriser_groupes_backfill) : lecture best-effort, ne doit jamais faire
